@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 from interfaces import (
     Question, Benchmark, TargetProfile, QuestionGeneratorConfig,
     GenerationResponse, Prompter, Verifier, TargetSelector,
@@ -55,12 +55,12 @@ class QuestionGenerator:
         self.prompter = build_prompter(config.prompter)
         self.target_selector = build_target_selector(config.target_selector)
 
-    def generate(self, benchmark: Benchmark) -> GenerationResponse:
+    def generate(self, benchmark: Benchmark, exclude_exemplar_ids: Optional[List[str]] = None) -> GenerationResponse:
         # 1. Select optimal target difficulty midpoint (or other custom loading profiles)
         target_profile = self.target_selector.select_target(benchmark)
 
         # 2. Retrieve exemplars, call LLM with reasoning, and parse generated candidates
-        prompter_response = self.prompter.get_examples(benchmark, target_profile)
+        prompter_response = self.prompter.get_examples(benchmark, target_profile, exclude_ids=exclude_exemplar_ids)
 
         # 3. Run solvability checks on all generated candidates
         verifier_responses = [self.verifier.verify(q) for q in prompter_response.questions]

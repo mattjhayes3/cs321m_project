@@ -116,14 +116,14 @@ class Prompter(ABC):
     and returns them parsed alongside the LLM execution trace.
     """
     @abstractmethod
-    def _select_examples(self, benchmark: Benchmark, target_profile: TargetProfile) -> List[Question]:
+    def _select_examples(self, benchmark: Benchmark, target_profile: TargetProfile, exclude_ids: Optional[List[str]] = None) -> List[Question]:
         """
         Selects seed exemplars from the benchmark pool.
         """
         pass
 
     @abstractmethod
-    def get_examples(self, benchmark: Benchmark, target_profile: TargetProfile) -> PrompterResponse:
+    def get_examples(self, benchmark: Benchmark, target_profile: TargetProfile, exclude_ids: Optional[List[str]] = None) -> PrompterResponse:
         """
         Performs active exemplar selection, prompts LLM, parses, and returns PrompterResponse.
         """
@@ -200,6 +200,7 @@ class NearbyExamplePrompterConfig:
     num_questions: int = 1
     min_discernability: Optional[float] = None
     max_discernability: Optional[float] = None
+    detailed_analysis_prompt: bool = False
     seed: int = None
     type: str = "nearby_example_prompter"
 
@@ -218,6 +219,7 @@ class ScaledExamplePrompterConfig:
     presentation: PresentationStyle = PresentationStyle.SCALE_10
     seed: int = None
     double_ended: bool = False
+    detailed_analysis_prompt: bool = False
     type: str = "scaled_example_prompter"
 
 @dataclass
@@ -246,6 +248,7 @@ class AddOptionPrompterConfig:
     min_difficulty: float = -3.0
     min_discernability: Optional[float] = None
     max_discernability: Optional[float] = None
+    selector_offset: float = 0.0
     seed: int = None
     type: str = "add_option_prompter"
 

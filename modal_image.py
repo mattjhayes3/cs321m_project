@@ -32,6 +32,8 @@ loop_image = (
         "transformers",
         "accelerate",
         "huggingface_hub>=1.5.0",
+        "lm-eval[hf,api]",
+        "tokenizers",
         "pandas",
         "numpy",
         "scipy",
@@ -52,6 +54,7 @@ loop_image = (
     .add_local_file("call_llm.py", "/root/call_llm.py", copy=True)
     .add_local_file("utils.py", "/root/utils.py", copy=True)
     .add_local_file("evaluate_generated.py", "/root/evaluate_generated.py", copy=True)
+    .add_local_file("benchmark.py", "/root/benchmark.py", copy=True)
     .add_local_file("main.py", "/root/main.py", copy=True)
     .add_local_file("modal_image.py", "/root/modal_image.py", copy=True)
     .add_local_dir("../Competition/torch_measure/src/torch_measure", "/root/torch_measure")

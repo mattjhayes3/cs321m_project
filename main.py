@@ -46,12 +46,13 @@ disable_progress_bars()
 from interfaces import (
     Question, Benchmark, TargetProfile, QuestionGeneratorConfig,
     NearbyExamplePrompterConfig, ScaledExamplePrompterConfig, PresentationStyle,
-    TrivialVerifierConfig, MidpointTargetSelectorConfig, LLMTrace
+    TrivialVerifierConfig, MidpointTargetSelectorConfig, LLMTrace,
+    IncreaseDifficultyPrompterConfig, AddOptionPrompterConfig
 )
 from irt_model import RaschModel
 from question_generator import QuestionGenerator
 from evaluate_generated import (
-    MODEL_REGISTRY, _score_options, _format_arc_easy_prompt
+    app, MODEL_REGISTRY, evaluate_questions_local
 )
 
 # ────────────────────────────────────────────────────────────────
@@ -104,7 +105,7 @@ MODEL_SUBSET = [
 # MODAL INFRASTRUCTURE
 # ────────────────────────────────────────────────────────────────
 
-app = modal.App("active-question-generation")
+
 
 results_vol = modal.Volume.from_name("benchmark-eval-results", create_if_missing=True)
 RESULTS_MOUNT = "/results"
@@ -140,7 +141,7 @@ class RealBenchmark(Benchmark):
         return pd.DataFrame()
 
 
-def load_calibrated_benchmark(volume):
+def load_calibrated_benchmark(volume, use_acc_norm: bool = True):
     """
     Load calibrated IRT parameters + original response matrix from Volume.
 
@@ -151,37 +152,72 @@ def load_calibrated_benchmark(volume):
 
     print("=== Loading Calibrated Benchmark ===")
 
-    # Read ability estimates (using optimal Rasch parameters)
-    ability_bytes = b""
-    for chunk in volume.read_file("arc_easy_eval/theta_comparison_comprehensive_acc_norm.csv"):
-        ability_bytes += chunk
-    ability_df = pd.read_csv(io.BytesIO(ability_bytes))
+    if use_acc_norm:
+        print("  [Mode] Utilizing length-normalized scoring (acc_norm).")
+        # Read ability estimates (using optimal Rasch parameters)
+        ability_bytes = b""
+        for chunk in volume.read_file("arc_easy_eval/theta_comparison_comprehensive_acc_norm.csv"):
+            ability_bytes += chunk
+        ability_df = pd.read_csv(io.BytesIO(ability_bytes))
 
-    # Read item parameters
-    try:
-        item_bytes = b""
-        for chunk in volume.read_file("arc_easy_eval/item_parameters_comprehensive_acc_norm.csv"):
-            item_bytes += chunk
-        item_params_df = pd.read_csv(io.BytesIO(item_bytes))
-        print("  Loaded comprehensive psychometric item parameters.")
-    except Exception as e:
-        raise FileNotFoundError(
-            f"❌ Critical Error: Could not load comprehensive psychometric item parameters "
-            f"(item_parameters_comprehensive_acc_norm.csv) from volume: {e}"
-        ) from e
+        # Read item parameters
+        try:
+            item_bytes = b""
+            for chunk in volume.read_file("arc_easy_eval/item_parameters_comprehensive_acc_norm.csv"):
+                item_bytes += chunk
+            item_params_df = pd.read_csv(io.BytesIO(item_bytes))
+            print("  Loaded comprehensive psychometric item parameters.")
+        except Exception as e:
+            raise FileNotFoundError(
+                f"❌ Critical Error: Could not load comprehensive psychometric item parameters "
+                f"(item_parameters_comprehensive_acc_norm.csv) from volume: {e}"
+            ) from e
 
-    # Read original response matrix
-    try:
-        resp_bytes = b""
-        for chunk in volume.read_file("arc_easy_eval/response_matrix_cumulative_acc_norm.csv"):
-            resp_bytes += chunk
-        original_response_matrix = pd.read_csv(io.BytesIO(resp_bytes), index_col=0)
-        print("  Loaded cumulative acc_norm response matrix.")
-    except Exception as e:
-        raise FileNotFoundError(
-            f"❌ Critical Error: Could not load cumulative response matrix "
-            f"(response_matrix_cumulative_acc_norm.csv) from volume: {e}"
-        ) from e
+        # Read original response matrix
+        try:
+            resp_bytes = b""
+            for chunk in volume.read_file("arc_easy_eval/response_matrix_cumulative_acc_norm.csv"):
+                resp_bytes += chunk
+            original_response_matrix = pd.read_csv(io.BytesIO(resp_bytes), index_col=0)
+            print("  Loaded cumulative acc_norm response matrix.")
+        except Exception as e:
+            raise FileNotFoundError(
+                f"❌ Critical Error: Could not load cumulative response matrix "
+                f"(response_matrix_cumulative_acc_norm.csv) from volume: {e}"
+            ) from e
+    else:
+        print("  [Mode] Utilizing raw accuracy scoring (acc) without normalization.")
+        # Read ability estimates (using optimal Rasch parameters)
+        ability_bytes = b""
+        for chunk in volume.read_file("arc_easy_eval/irt_ability_estimates.csv"):
+            ability_bytes += chunk
+        ability_df = pd.read_csv(io.BytesIO(ability_bytes))
+
+        # Read item parameters
+        try:
+            item_bytes = b""
+            for chunk in volume.read_file("arc_easy_eval/irt_item_parameters.csv"):
+                item_bytes += chunk
+            item_params_df = pd.read_csv(io.BytesIO(item_bytes))
+            print("  Loaded raw psychometric item parameters.")
+        except Exception as e:
+            raise FileNotFoundError(
+                f"❌ Critical Error: Could not load raw psychometric item parameters "
+                f"(irt_item_parameters.csv) from volume: {e}"
+            ) from e
+
+        # Read original response matrix
+        try:
+            resp_bytes = b""
+            for chunk in volume.read_file("arc_easy_eval/response_matrix.csv"):
+                resp_bytes += chunk
+            original_response_matrix = pd.read_csv(io.BytesIO(resp_bytes), index_col=0)
+            print("  Loaded raw response matrix.")
+        except Exception as e:
+            raise FileNotFoundError(
+                f"❌ Critical Error: Could not load raw response matrix "
+                f"(response_matrix.csv) from volume: {e}"
+            ) from e
 
     # Load ARC-Easy questions from HuggingFace
     print("  Loading ARC-Easy questions from HuggingFace...")
@@ -190,18 +226,29 @@ def load_calibrated_benchmark(volume):
     # Build RaschModel
     irt = RaschModel()
 
-    for _, row in ability_df.iterrows():
-        model_name = str(row["Model"])
-        if MODEL_SUBSET and model_name not in MODEL_SUBSET:
-            continue
-        # Load Rasch_Theta (1PL MLE ability estimate) as standard subject ability
-        irt.thetas[model_name] = float(row["Rasch_Theta"])
+    if use_acc_norm:
+        for _, row in ability_df.iterrows():
+            model_name = str(row["Model"])
+            if MODEL_SUBSET and model_name not in MODEL_SUBSET:
+                continue
+            irt.thetas[model_name] = float(row["Rasch_Theta"])
 
-    # Map Rasch difficulties and 2PL EM discriminations (for discernability filtering)
-    for _, row in item_params_df.iterrows():
-        item_id = str(row["item_id"])
-        irt.difficulties[item_id] = float(row["Rasch_Difficulty"])
-        irt.discriminations[item_id] = float(row["EM_Discrimination"])
+        for _, row in item_params_df.iterrows():
+            item_id = str(row["item_id"])
+            irt.difficulties[item_id] = float(row["Rasch_Difficulty"])
+            irt.discriminations[item_id] = float(row["EM_Discrimination"])
+    else:
+        for _, row in ability_df.iterrows():
+            model_name = str(row["model"])
+            if MODEL_SUBSET and model_name not in MODEL_SUBSET:
+                continue
+            irt.thetas[model_name] = float(row["theta"])
+
+        for _, row in item_params_df.iterrows():
+            item_id = str(row["item_id"])
+            irt.difficulties[item_id] = float(row["b_difficulty"])
+            # 1PL/Rasch baseline has no discrimination, default to 1.0 for filtering safety
+            irt.discriminations[item_id] = 1.0
 
     irt.valid_items = list(irt.difficulties.keys())
 
@@ -244,252 +291,7 @@ def load_calibrated_benchmark(volume):
     return benchmark, original_response_matrix
 
 
-def _bin_pack_models(
-    model_names: List[str],
-    vram_budget_gb: float = 80.0,
-    safety_margin_gb: float = 4.0,
-) -> List[List[str]]:
-    """
-    First-fit-decreasing bin-packing of models into VRAM batches.
 
-    Groups models so that each batch's total estimated VRAM fits within
-    (vram_budget_gb - safety_margin_gb). Models that exceed the budget
-    alone get their own singleton batch.
-
-    Returns a list of batches, where each batch is a list of model names.
-    """
-    usable = vram_budget_gb - safety_margin_gb
-
-    # Sort by VRAM descending (first-fit-decreasing heuristic)
-    models_with_vram = []
-    for name in model_names:
-        reg = MODEL_REGISTRY.get(name)
-        vram = reg.get("vram_gb", 10.0) if reg else 10.0
-        models_with_vram.append((name, vram))
-    models_with_vram.sort(key=lambda x: x[1], reverse=True)
-
-    batches: List[List[str]] = []
-    batch_usage: List[float] = []
-
-    for name, vram in models_with_vram:
-        placed = False
-        for i, used in enumerate(batch_usage):
-            if used + vram <= usable:
-                batches[i].append(name)
-                batch_usage[i] += vram
-                placed = True
-                break
-        if not placed:
-            batches.append([name])
-            batch_usage.append(vram)
-
-    return batches
-
-
-def evaluate_questions_local(
-    questions: List[Dict[str, Any]],
-    model_names: List[str],
-    safety_margin_gb: float = 4.0,
-) -> pd.DataFrame:
-    """
-    Evaluates generated questions across models using VRAM bin-packing.
-
-    Models are grouped into batches that fit within the A100-80GB budget.
-    All models in a batch are loaded simultaneously, scored, then freed
-    together — minimizing redundant load/unload cycles for small models.
-
-    If a batch triggers an OOM during loading, all loaded models are flushed
-    and the remaining unscored models from that batch are evaluated
-    one-at-a-time as a fallback.
-    """
-    import torch
-    import gc
-    import time
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    rows = {}
-    all_score_details = {}  # model_name -> {question_id -> scoring breakdown}
-
-    def _load_model(model_name):
-        """Load a single model. Returns (hf_model, tokenizer) or raises."""
-        reg = MODEL_REGISTRY[model_name]
-        hf_id = reg["hf_id"]
-        trust_remote_code = reg.get("trust_remote_code", False)
-
-        tokenizer_kwargs = {}
-        if "mistral" in hf_id.lower():
-            tokenizer_kwargs["fix_mistral_regex"] = True
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            hf_id, trust_remote_code=trust_remote_code, **tokenizer_kwargs
-        )
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            hf_id,
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-            device_map="auto",
-            trust_remote_code=trust_remote_code,
-        )
-        hf_model.eval()
-        return hf_model, tokenizer
-
-    def _score_model(model_name, hf_model, tokenizer):
-        """Score all questions on a single model. Returns result_row dict + detailed scoring."""
-        result_row = {}
-        score_details = {}  # question_id -> full scoring breakdown
-        n_correct = 0
-        n_correct_norm = 0
-
-        for q in questions:
-            score_result = _score_options(
-                hf_model, tokenizer, q["question_text"], q["options"], device
-            )
-            pred_idx = score_result["pred_idx_norm"]
-            pred_letter = chr(65 + pred_idx)
-            expected = q["correct_answer"].strip().upper()
-            correct = int(pred_letter == expected)
-            n_correct_norm += correct
-            result_row[q["id"]] = correct
-
-            pred_letter_raw = chr(65 + score_result["pred_idx"])
-            n_correct += int(pred_letter_raw == expected)
-
-            # Preserve full scoring breakdown for this (model, question) pair
-            score_details[q["id"]] = {
-                "scores": score_result["scores"],            # raw log-likelihoods per option
-                "scores_norm": score_result["scores_norm"],  # length-normalized log-likelihoods
-                "pred_idx": score_result["pred_idx"],        # argmax raw
-                "pred_idx_norm": score_result["pred_idx_norm"],  # argmax norm
-                "pred_letter": pred_letter,                  # predicted answer (acc_norm)
-                "pred_letter_raw": pred_letter_raw,          # predicted answer (acc)
-                "expected": expected,
-                "correct_norm": correct,
-                "correct_raw": int(pred_letter_raw == expected),
-            }
-
-        acc_norm = n_correct_norm / len(questions) if questions else 0.0
-        acc_raw = n_correct / len(questions) if questions else 0.0
-        return result_row, acc_norm, acc_raw, score_details
-
-    def _flush_gpu(loaded_dict):
-        """Unload all models and clear GPU memory."""
-        for k in list(loaded_dict.keys()):
-            del loaded_dict[k]
-        loaded_dict.clear()
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    def _eval_single_fallback(model_name):
-        """Fallback: load→score→unload a single model."""
-        nonlocal models_done
-        reg = MODEL_REGISTRY.get(model_name)
-        if not reg:
-            rows[model_name] = {q["id"]: float("nan") for q in questions}
-            return
-        t0 = time.time()
-        try:
-            hf_model, tokenizer = _load_model(model_name)
-            load_time = time.time() - t0
-            result_row, acc_norm, acc_raw, sd = _score_model(model_name, hf_model, tokenizer)
-            models_done += 1
-            elapsed = time.time() - t0
-            print(f"    ✅ [{models_done}/{len(model_names)}] {model_name}: {acc_norm:.0%} (acc_norm) [{acc_raw:.0%} raw] in {elapsed:.1f}s (fallback, load={load_time:.1f}s)")
-            rows[model_name] = result_row
-            all_score_details[model_name] = sd
-        except Exception as e:
-            print(f"    ❌ {model_name} failed in fallback: {e}")
-            rows[model_name] = {q["id"]: float("nan") for q in questions}
-        finally:
-            for v in ['hf_model', 'tokenizer']:
-                if v in locals():
-                    del locals()[v]
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-    batches = _bin_pack_models(model_names, vram_budget_gb=80.0, safety_margin_gb=safety_margin_gb)
-    print(f"\n  🚀 VRAM bin-packing: {len(model_names)} models → {len(batches)} batches")
-    for bi, batch in enumerate(batches):
-        vram_est = sum(MODEL_REGISTRY.get(m, {}).get("vram_gb", 10.0) for m in batch)
-        print(f"    Batch {bi+1}: {batch} (est. {vram_est:.1f}GB)")
-
-    models_done = 0
-    eval_start = time.time()
-
-    for bi, batch in enumerate(batches):
-        batch_vram = sum(MODEL_REGISTRY.get(m, {}).get("vram_gb", 10.0) for m in batch)
-        print(f"\n  ── Batch {bi+1}/{len(batches)}: loading {len(batch)} models (est. {batch_vram:.1f}GB) ──")
-        batch_start = time.time()
-
-        # Phase 1: Try to load all models in this batch
-        loaded = {}  # model_name -> (hf_model, tokenizer)
-        fallback_needed = []
-        oom_hit = False
-
-        for model_name in batch:
-            if model_name not in MODEL_REGISTRY:
-                print(f"    ⚠️  Unknown model: {model_name}, skipping.")
-                continue
-            if oom_hit:
-                # Previous load OOM'd; defer remaining models to fallback
-                fallback_needed.append(model_name)
-                continue
-
-            t0 = time.time()
-            try:
-                hf_model, tokenizer = _load_model(model_name)
-                load_time = time.time() - t0
-                print(f"    ✓ Loaded {model_name} in {load_time:.1f}s")
-                loaded[model_name] = (hf_model, tokenizer)
-            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-                if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
-                    print(f"    ⚠️ OOM loading {model_name} — flushing batch, falling back to sequential")
-                    oom_hit = True
-                    fallback_needed.append(model_name)
-                    # Flush everything loaded so far, score what we have first
-                else:
-                    print(f"    ❌ Failed to load {model_name}: {e}")
-                    rows[model_name] = {q["id"]: float("nan") for q in questions}
-            except Exception as e:
-                print(f"    ❌ Failed to load {model_name}: {e}")
-                rows[model_name] = {q["id"]: float("nan") for q in questions}
-
-        # Phase 2: Score all successfully loaded models
-        for model_name, (hf_model, tokenizer) in loaded.items():
-            models_done += 1
-            t0 = time.time()
-            try:
-                result_row, acc_norm, acc_raw, sd = _score_model(model_name, hf_model, tokenizer)
-                elapsed = time.time() - t0
-                print(f"    ✅ [{models_done}/{len(model_names)}] {model_name}: {acc_norm:.0%} (acc_norm) [{acc_raw:.0%} raw] scored in {elapsed:.1f}s")
-                rows[model_name] = result_row
-                all_score_details[model_name] = sd
-            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-                print(f"    ⚠️ OOM scoring {model_name}, will retry in fallback")
-                fallback_needed.append(model_name)
-                models_done -= 1  # will re-increment in fallback
-
-        # Phase 3: Unload entire batch
-        _flush_gpu(loaded)
-
-        # Phase 4: Fallback — evaluate OOM'd models one-at-a-time
-        if fallback_needed:
-            print(f"    🔄 Fallback: evaluating {len(fallback_needed)} models sequentially")
-            for model_name in fallback_needed:
-                _eval_single_fallback(model_name)
-
-        batch_elapsed = time.time() - batch_start
-        print(f"  ── Batch {bi+1} done in {batch_elapsed:.1f}s ──")
-
-    total_elapsed = time.time() - eval_start
-    print(f"\n  🏁 All {len(model_names)} models evaluated in {total_elapsed:.1f}s ({len(batches)} batches)")
-
-
-    return pd.DataFrame.from_dict(rows, orient="index"), all_score_details
 
 
 # ────────────────────────────────────────────────────────────────
@@ -515,7 +317,6 @@ def save_json(path: str, data: dict):
 
 @app.function(
     image=loop_image,
-    gpu="A100-80GB",
     timeout=14400,  # 4 hours max
     volumes={
         RESULTS_MOUNT: results_vol,
@@ -534,6 +335,14 @@ def run_active_loop(
     num_generation_steps: int = 10,
     generator_model: str = "openai/gpt-5.5",
     seed: int = 42,
+    prompter_type: str = "scaled_example",
+    double_ended: bool = True,
+    use_discernability: bool = True,
+    delta_percent: float = 0.25,
+    detailed_analysis_prompt: bool = False,
+    selector_offset: float = 0.0,
+    use_acc_norm: bool = True,
+    test_run: bool = False,
 ) -> str:
     """
     Full active question generation loop on a single A100.
@@ -548,6 +357,12 @@ def run_active_loop(
 
     Returns JSON summary of all rounds.
     """
+    global MODEL_SUBSET
+    if test_run:
+        MODEL_SUBSET = [m for m in MODEL_SUBSET if MODEL_REGISTRY[m].get("vram_gb", 0) < 7.0]
+        print(f"🧪 [Test Run Mode] Restricting evaluation to {len(MODEL_SUBSET)} models < 7GB:")
+        print(f"   {sorted(MODEL_SUBSET)}")
+
     from huggingface_hub import login
     if os.environ.get("HF_TOKEN"):
         login(os.environ["HF_TOKEN"], add_to_git_credential=False)
@@ -571,17 +386,23 @@ def run_active_loop(
     set_all_seeds(seed)
 
     # ── Create timestamped run directory ────────────────────────
-    run_id = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%S")
+    suffix = prompter_type
+    if prompter_type == "scaled_example":
+        suffix += "_double" if double_ended else "_single"
+    run_id = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%S") + f"_{suffix}"
     run_dir = create_run_dir(RESULTS_MOUNT, run_id)
     print(f"\n  Run directory: active_loop_runs/{run_id}/")
 
     # ── Load benchmark first ────────────────────────────────────
     volume = modal.Volume.from_name("benchmark-eval-results")
-    benchmark, original_response_matrix = load_calibrated_benchmark(volume)
+    benchmark, original_response_matrix = load_calibrated_benchmark(volume, use_acc_norm=use_acc_norm)
     irt = benchmark.calibrated_model
 
-    # Identify the Saturation Band dynamically (Rasch MLE abilities > 0.5)
-    saturation_models = [m for m, th in irt.thetas.items() if th > 0.5]
+    # Identify the Saturation Band dynamically (Rasch MLE abilities > 0.5, or > -1.5 for test runs)
+    threshold = -1.5 if test_run else 0.5
+    saturation_models = [m for m, th in irt.thetas.items() if th > threshold]
+    if test_run:
+        saturation_models = [m for m in saturation_models if m in MODEL_SUBSET]
     print(f"\n🎯 [Saturation Band] Identified {len(saturation_models)} models with θ > 0.5:")
     print(f"   {sorted(saturation_models)}")
 
@@ -592,6 +413,13 @@ def run_active_loop(
         "num_generation_steps": num_generation_steps,
         "generator_model": generator_model,
         "seed": seed,
+        "prompter_type": prompter_type,
+        "detailed_analysis_prompt": detailed_analysis_prompt,
+        "selector_offset": selector_offset,
+        "use_acc_norm": use_acc_norm,
+        "double_ended": double_ended,
+        "use_discernability": use_discernability,
+        "delta_percent": delta_percent,
         "model_subset": MODEL_SUBSET,
         "saturation_models": saturation_models,
         "timestamp": run_id,
@@ -600,11 +428,13 @@ def run_active_loop(
 
     # ── 1. Calculate Initial Target Pairs inside the Saturation Band ──
     initial_target_separabilities = {}
+    all_initial_separabilities = {}
     target_pairs = []
     for i in range(len(saturation_models)):
         for j in range(i + 1, len(saturation_models)):
             m_x, m_y = saturation_models[i], saturation_models[j]
             sep_xy = irt.compute_separability(m_x, m_y)
+            all_initial_separabilities[f"{m_x}_vs_{m_y}"] = sep_xy
             if sep_xy["confidence"] < 0.95:
                 target_pairs.append((m_x, m_y, sep_xy["confidence"]))
                 initial_target_separabilities[f"{m_x}_vs_{m_y}"] = sep_xy
@@ -635,7 +465,8 @@ def run_active_loop(
     print(f"{'='*80}")
 
     # Baseline abilities mapping for scale drift MAE tracking (using saturation models)
-    baseline_abilities = {m: float(irt.get_subject_ability(m)[0]) for m in saturation_models}
+    baseline_abilities = dict(irt.thetas)
+    baseline_difficulties = dict(irt.difficulties)
 
     loop_start = time.time()
 
@@ -663,6 +494,8 @@ def run_active_loop(
         # ── 2. Multi-Step Question Generation Loops ──
         round_new_questions = []
         round_step_details = []
+        question_to_step = {}
+        used_exemplar_ids = set()
 
         for step_idx in range(1, num_generation_steps + 1):
             if not target_pairs: break
@@ -670,29 +503,91 @@ def run_active_loop(
             tgt_a, tgt_b, current_conf = target_pairs[state.choice(len(target_pairs))]
             step_target_diff = (irt.get_subject_ability(tgt_a)[0] + irt.get_subject_ability(tgt_b)[0]) / 2.0
 
-            config = QuestionGeneratorConfig(
-                prompter=ScaledExamplePrompterConfig(
+            if prompter_type == "scaled_example":
+                prompter_config = ScaledExamplePrompterConfig(
                     generator_model=generator_model,
                     temperature=0.7,
-                    thinking_budget=2048,
+                    thinking_budget=4096,
                     max_tokens=16384,
                     p=2.0,
                     num_examples=4,
                     num_questions=questions_per_round,
                     min_difficulty=step_target_diff - 1.5,
                     presentation=PresentationStyle.POSITIVE_UNBOUNDED,
-                    double_ended=True,
-                    min_discernability=1,
-                    max_discernability=10,
+                    double_ended=double_ended,
+                    min_discernability=1 if use_discernability else None,
+                    max_discernability=10 if use_discernability else None,
+                    detailed_analysis_prompt=detailed_analysis_prompt,
                     seed=round_seed + step_idx,
-                ),
+                )
+            elif prompter_type == "increase_difficulty":
+                prompter_config = IncreaseDifficultyPrompterConfig(
+                    generator_model=generator_model,
+                    temperature=0.7,
+                    thinking_budget=4096,
+                    max_tokens=16384,
+                    p=2.0,
+                    num_questions=questions_per_round,
+                    delta_percent=delta_percent,
+                    min_difficulty=step_target_diff - 1.5,
+                    min_discernability=1 if use_discernability else None,
+                    max_discernability=10 if use_discernability else None,
+                    seed=round_seed + step_idx,
+                )
+            elif prompter_type == "add_option":
+                prompter_config = AddOptionPrompterConfig(
+                    generator_model=generator_model,
+                    temperature=0.7,
+                    thinking_budget=4096,
+                    max_tokens=16384,
+                    p=2.0,
+                    num_questions=questions_per_round,
+                    min_difficulty=step_target_diff - 1.5,
+                    min_discernability=1 if use_discernability else None,
+                    max_discernability=10 if use_discernability else None,
+                    selector_offset=selector_offset,
+                    seed=round_seed + step_idx,
+                )
+            elif prompter_type == "nearby_example":
+                prompter_config = NearbyExamplePrompterConfig(
+                    generator_model=generator_model,
+                    temperature=0.7,
+                    thinking_budget=4096,
+                    max_tokens=16384,
+                    p=2.0,
+                    num_examples=4,
+                    num_questions=questions_per_round,
+                    min_discernability=1 if use_discernability else None,
+                    max_discernability=10 if use_discernability else None,
+                    detailed_analysis_prompt=detailed_analysis_prompt,
+                    seed=round_seed + step_idx,
+                )
+            else:
+                raise ValueError(f"Unknown prompter_type: {prompter_type}")
+
+            config = QuestionGeneratorConfig(
+                prompter=prompter_config,
                 verifier=TrivialVerifierConfig(),
                 target_selector=MidpointTargetSelectorConfig(model_a=tgt_a, model_b=tgt_b),
             )
-            response = QuestionGenerator(config).generate(benchmark)
+            response = QuestionGenerator(config).generate(benchmark, exclude_exemplar_ids=list(used_exemplar_ids))
+            if response and response.prompter_response and response.prompter_response.exemplars:
+                for eq in response.prompter_response.exemplars:
+                    assert eq.id not in used_exemplar_ids, f"Exemplar {eq.id} was reused!"
+                    used_exemplar_ids.add(eq.id)
             step_new_questions = response.verified_questions if response else []
             round_new_questions.extend(step_new_questions)
             all_generation_responses.append(response)
+
+            exemplar_ids = [eq.id for eq in (response.prompter_response.exemplars or [])] if response and response.prompter_response else []
+            for sq in step_new_questions:
+                question_to_step[sq.id] = {
+                    "step_idx": step_idx,
+                    "midpoint_diff": float(step_target_diff),
+                    "model_a": tgt_a,
+                    "model_b": tgt_b,
+                    "exemplar_ids": exemplar_ids,
+                }
 
             # Serialize full step details including LLM traces and exemplars
             step_detail = {
@@ -753,7 +648,13 @@ def run_active_loop(
         all_generated_questions.extend(round_new_questions)
 
         # ── 3. Evaluation ─────────────
-        round_response_matrix, round_scoring_details = evaluate_questions_local([{"id": q.id, "question_text": q.question_text, "options": q.options, "correct_answer": q.correct_answer} for q in round_new_questions], MODEL_SUBSET)
+        round_response_matrix, round_scoring_details = evaluate_questions_local(
+            [{"id": q.id, "question_text": q.question_text, "options": q.options, "correct_answer": q.correct_answer} for q in round_new_questions],
+            MODEL_SUBSET,
+            run_id,
+            round_num,
+            use_acc_norm=use_acc_norm
+        )
         all_scoring_details[round_num] = round_scoring_details
         
         # Filter out degenerate (0% or 100% correct) questions across evaluated models
@@ -803,24 +704,7 @@ def run_active_loop(
             original_response_matrix=aug_anchor_matrix
         )
 
-        # Calculate Difficulty Targeting MAE (average absolute error vs target midpoint)
-        targeting_abs_errors = []
-        question_details = []
-        for q in round_new_questions:
-            target_b = q.difficulty  # original target midpoint stored in prompter
-            fitted_b = irt.difficulties[q.id]
-            targeting_abs_errors.append(abs(fitted_b - target_b))
-            
-            question_details.append({
-                "id": q.id,
-                "question_text": q.question_text,
-                "options": q.options,
-                "correct_answer": q.correct_answer,
-                "target_difficulty": float(target_b),
-                "calibrated_difficulty": float(fitted_b)
-            })
-        targeting_mae = float(np.mean(targeting_abs_errors)) if targeting_abs_errors else 0.0
-        print(f"  🎯 Targeting Precision - Difficulty MAE (vs target):  {targeting_mae:.4f}")
+        original_targets = {q.id: float(q.difficulty) for q in round_new_questions}
 
         # ── 5. Promote calibrated questions into benchmark pool ──
         # These become exemplar candidates for future rounds and anchors for future refits.
@@ -833,15 +717,145 @@ def run_active_loop(
             benchmark.questions.append(q)
             calibrated_gen_ids.add(q.id)
 
-        avg_disc = 1.0
-        print(f"  📏 Average discernability of round {round_num} generated questions: {avg_disc:.3f}")
+        # ── 6. Compute Post-Refit Separabilities under BOTH Fits ──
+        # Build a temporary RaschModel representing the strictly anchored-theta fit
+        import copy
+        from scipy.optimize import minimize_scalar
+        from scipy.special import expit
+        
+        anchored_irt = RaschModel()
+        anchored_irt.thetas = copy.deepcopy(baseline_abilities)
+        anchored_irt.difficulties = copy.deepcopy(baseline_difficulties)
+        
+        # Fit b_anchored for all generated items in this round using strictly fixed baseline thetas
+        fixed_theta_arr = np.array([baseline_abilities[m] for m in MODEL_SUBSET])
+        for q in round_new_questions:
+            R_q = round_response_matrix.loc[MODEL_SUBSET, q.id].values.astype(float)
+            valid = ~np.isnan(R_q)
+            if valid.any():
+                R_c = R_q[valid]
+                T_c = fixed_theta_arr[valid]
+                mean_r = np.clip(R_c.mean(), 0.01, 0.99)
+                
+                def neg_ll(b_val):
+                    P = expit(T_c - b_val)
+                    P = np.clip(P, 1e-15, 1 - 1e-15)
+                    return -np.sum(R_c * np.log(P) + (1 - R_c) * np.log(1 - P))
+                
+                b_init = -np.log(mean_r / (1 - mean_r))
+                res = minimize_scalar(neg_ll, bounds=(b_init - 10, b_init + 10), method='bounded')
+                b_val = float(res.x)
+            else:
+                b_val = 0.0
+            anchored_irt.difficulties[q.id] = b_val
+            
+        anchored_irt.valid_items = list(anchored_irt.difficulties.keys())
 
-        # Compute post-refit separabilities for all initial target pairs
+        # ── Comprehensive Difficulty Metrics (across all fits) ──
+        question_details = []
+        difficulty_shifts_fpc = []
+        difficulty_shifts_anchored = []
+        targeting_errors_anchored = []
+        targeting_errors_fpc = []
+        
+        for q in round_new_questions:
+            target_b = original_targets[q.id]
+            fpc_b = float(irt.difficulties[q.id])
+            anch_b = float(anchored_irt.difficulties[q.id])
+            
+            step_info = question_to_step.get(q.id, {})
+            exemplar_ids = step_info.get("exemplar_ids", [])
+            
+            exemplar_diffs_baseline = []
+            exemplar_diffs_fpc = []
+            for eid in exemplar_ids:
+                if eid in baseline_difficulties:
+                    exemplar_diffs_baseline.append(baseline_difficulties[eid])
+                if eid in irt.difficulties:
+                    exemplar_diffs_fpc.append(float(irt.difficulties[eid]))
+            
+            exemplar_ref_baseline = None
+            exemplar_ref_fpc = None
+            if exemplar_diffs_baseline:
+                exemplar_ref_baseline = float(np.max(exemplar_diffs_baseline))
+                exemplar_ref_fpc = float(np.max(exemplar_diffs_fpc)) if exemplar_diffs_fpc else None
+            
+            shift_anchored = (anch_b - exemplar_ref_baseline) if exemplar_ref_baseline is not None else None
+            shift_fpc = (fpc_b - exemplar_ref_fpc) if exemplar_ref_fpc is not None else None
+            
+            if shift_anchored is not None:
+                difficulty_shifts_anchored.append(shift_anchored)
+            if shift_fpc is not None:
+                difficulty_shifts_fpc.append(shift_fpc)
+            
+            targeting_errors_anchored.append(anch_b - target_b)
+            targeting_errors_fpc.append(fpc_b - target_b)
+            
+            question_details.append({
+                "id": q.id,
+                "question_text": q.question_text,
+                "options": q.options,
+                "correct_answer": q.correct_answer,
+                "target_difficulty": float(target_b),
+                "calibrated_difficulty_fpc": fpc_b,
+                "calibrated_difficulty_anchored": anch_b,
+                "exemplar_ids": exemplar_ids,
+                "exemplar_ref_baseline": exemplar_ref_baseline,
+                "exemplar_ref_fpc": exemplar_ref_fpc,
+                "shift_from_exemplar_anchored": shift_anchored,
+                "shift_from_exemplar_fpc": shift_fpc,
+                "step_info": step_info,
+            })
+        
+        # Anchored stats with SEM
+        mean_signed_a = np.mean(targeting_errors_anchored) if targeting_errors_anchored else 0.0
+        sem_signed_a = np.std(targeting_errors_anchored, ddof=1) / np.sqrt(len(targeting_errors_anchored)) if len(targeting_errors_anchored) > 1 else 0.0
+        abs_errors_a = np.abs(targeting_errors_anchored) if targeting_errors_anchored else []
+        targeting_mae_anchored = float(np.mean(abs_errors_a)) if len(abs_errors_a) > 0 else 0.0
+        sem_mae_a = np.std(abs_errors_a, ddof=1) / np.sqrt(len(abs_errors_a)) if len(abs_errors_a) > 1 else 0.0
+        
+        # FPC stats with SEM
+        mean_signed_f = np.mean(targeting_errors_fpc) if targeting_errors_fpc else 0.0
+        sem_signed_f = np.std(targeting_errors_fpc, ddof=1) / np.sqrt(len(targeting_errors_fpc)) if len(targeting_errors_fpc) > 1 else 0.0
+        abs_errors_f = np.abs(targeting_errors_fpc) if targeting_errors_fpc else []
+        targeting_mae_fpc = float(np.mean(abs_errors_f)) if len(abs_errors_f) > 0 else 0.0
+        sem_mae_f = np.std(abs_errors_f, ddof=1) / np.sqrt(len(abs_errors_f)) if len(abs_errors_f) > 1 else 0.0
+        
+        print(f"\n  🎯 Difficulty Targeting (vs midpoint):")
+        print(f"    [Anchored-θ]  MAE={targeting_mae_anchored:.4f} ± {sem_mae_a:.4f} (SEM)  mean_err={mean_signed_a:+.4f} ± {sem_signed_a:.4f} (SEM)  median_err={np.median(targeting_errors_anchored):+.4f}" if targeting_errors_anchored else "    [Anchored-θ]  N/A")
+        print(f"    [FPC]         MAE={targeting_mae_fpc:.4f} ± {sem_mae_f:.4f} (SEM)  mean_err={mean_signed_f:+.4f} ± {sem_signed_f:.4f} (SEM)  median_err={np.median(targeting_errors_fpc):+.4f}" if targeting_errors_fpc else "    [FPC]         N/A")
+        
+        if difficulty_shifts_anchored:
+            shifts_a = np.array(difficulty_shifts_anchored)
+            shifts_f = np.array(difficulty_shifts_fpc) if difficulty_shifts_fpc else np.array([])
+            
+            mean_shift_a = shifts_a.mean()
+            sem_shift_a = shifts_a.std(ddof=1) / np.sqrt(len(shifts_a)) if len(shifts_a) > 1 else 0.0
+            
+            print(f"\n  📐 Difficulty Shift from Exemplar ({prompter_type}):")
+            print(f"    [Anchored-θ]  mean={mean_shift_a:+.4f} ± {sem_shift_a:.4f} (SEM)  median={np.median(shifts_a):+.4f}  std={shifts_a.std():.4f}  range=[{shifts_a.min():+.3f}, {shifts_a.max():+.3f}]")
+            if len(shifts_f) > 0:
+                mean_shift_f = shifts_f.mean()
+                sem_shift_f = shifts_f.std(ddof=1) / np.sqrt(len(shifts_f)) if len(shifts_f) > 1 else 0.0
+                print(f"    [FPC]         mean={mean_shift_f:+.4f} ± {sem_shift_f:.4f} (SEM)  median={np.median(shifts_f):+.4f}  std={shifts_f.std():.4f}  range=[{shifts_f.min():+.3f}, {shifts_f.max():+.3f}]")
+            
+            buckets = [(-np.inf, -1.0), (-1.0, -0.5), (-0.5, 0.0), (0.0, 0.5), (0.5, 1.0), (1.0, 2.0), (2.0, np.inf)]
+            bucket_labels = ["<-1.0", "-1.0 to -0.5", "-0.5 to 0.0", "0.0 to +0.5", "+0.5 to +1.0", "+1.0 to +2.0", ">+2.0"]
+            counts = [int(np.sum((shifts_a >= lo) & (shifts_a < hi))) for lo, hi in buckets]
+            print(f"    Shift distribution (anchored): {dict(zip(bucket_labels, counts))}")
+        
+        targeting_mae = targeting_mae_anchored
+        avg_disc = 1.0
+
         target_pairs_separability = {}
+        target_pairs_separability_anchored = {}
         newly_resolved = 0
         unresolved_remaining = 0
+        newly_resolved_anchored = 0
+        unresolved_remaining_anchored = 0
         
         print(f"\n  📊 Updated Target Pairs Separability (Round {round_num}):")
+        print("    [Unanchored Fit - production]")
         for pair_key in initial_target_separabilities.keys():
             m_x, m_y = pair_key.split("_vs_")
             sep_xy = irt.compute_separability(m_x, m_y)
@@ -852,14 +866,56 @@ def run_active_loop(
             
             if curr_conf >= 0.95 and init_conf < 0.95:
                 newly_resolved += 1
-                print(f"    🎉 RESOLVED: ({m_x:>20s}, {m_y:>20s}) separated with {curr_conf:.2%} confidence (was {init_conf:.2%})")
+                print(f"      🎉 RESOLVED: ({m_x:>20s}, {m_y:>20s}) separated with {curr_conf:.2%} confidence (was {init_conf:.2%})")
             else:
                 unresolved_remaining += 1
-                # For unresolved, print confidence changes if they are close
                 if curr_conf < 0.95:
-                    print(f"    • ({m_x:>20s}, {m_y:>20s}) -> curr_conf = {curr_conf:.2%} (was {init_conf:.2%}, z_shift = {sep_xy['z'] - initial_target_separabilities[pair_key]['z']:+.2f})")
+                    print(f"      • ({m_x:>20s}, {m_y:>20s}) -> curr_conf = {curr_conf:.2%} (was {init_conf:.2%}, z_shift = {sep_xy['z'] - initial_target_separabilities[pair_key]['z']:+.2f})")
 
-        print(f"  📊 Target pairs separation update: resolved {newly_resolved} pairs, {unresolved_remaining} remain unresolved.")
+        print("    [Strictly Anchored-Theta Fit - diagnostic]")
+        for pair_key in initial_target_separabilities.keys():
+            m_x, m_y = pair_key.split("_vs_")
+            sep_xy_anchored = anchored_irt.compute_separability(m_x, m_y)
+            target_pairs_separability_anchored[pair_key] = sep_xy_anchored
+            
+            init_conf = initial_target_separabilities[pair_key]["confidence"]
+            curr_conf_anchored = sep_xy_anchored["confidence"]
+            
+            if curr_conf_anchored >= 0.95 and init_conf < 0.95:
+                newly_resolved_anchored += 1
+                print(f"      🎉 RESOLVED (Anchored): ({m_x:>20s}, {m_y:>20s}) separated with {curr_conf_anchored:.2%} confidence (was {init_conf:.2%})")
+            else:
+                unresolved_remaining_anchored += 1
+                if curr_conf_anchored < 0.95:
+                    print(f"      • ({m_x:>20s}, {m_y:>20s}) -> curr_conf = {curr_conf_anchored:.2%} (was {init_conf:.2%}, z_shift = {sep_xy_anchored['z'] - initial_target_separabilities[pair_key]['z']:+.2f})")
+                    
+        print(f"  📊 Target pairs separation update (unanchored): resolved {newly_resolved} pairs, {unresolved_remaining} remain unresolved.")
+        print(f"  📊 Target pairs separation update (anchored):   resolved {newly_resolved_anchored} pairs, {unresolved_remaining_anchored} remain unresolved.")
+
+        newly_confounded_fpc = []
+        newly_confounded_anchored = []
+        for pair_key, init_sep in all_initial_separabilities.items():
+            if pair_key in initial_target_separabilities:
+                continue
+            if init_sep["confidence"] >= 0.95:
+                m_x, m_y = pair_key.split("_vs_")
+                curr_sep = irt.compute_separability(m_x, m_y)
+                if curr_sep["confidence"] < 0.95:
+                    newly_confounded_fpc.append((pair_key, init_sep["confidence"], curr_sep["confidence"]))
+                curr_sep_a = anchored_irt.compute_separability(m_x, m_y)
+                if curr_sep_a["confidence"] < 0.95:
+                    newly_confounded_anchored.append((pair_key, init_sep["confidence"], curr_sep_a["confidence"]))
+        
+        if newly_confounded_fpc:
+            print(f"  ⚠️  Newly confounded pairs (FPC): {len(newly_confounded_fpc)} pairs dropped below 95%")
+            for pk, ic, cc in newly_confounded_fpc:
+                m_x, m_y = pk.split("_vs_")
+                print(f"      ⬇ ({m_x:>20s}, {m_y:>20s}) was {ic:.2%} → now {cc:.2%}")
+        if newly_confounded_anchored:
+            print(f"  ⚠️  Newly confounded pairs (anchored-θ): {len(newly_confounded_anchored)} pairs dropped below 95%")
+            for pk, ic, cc in newly_confounded_anchored:
+                m_x, m_y = pk.split("_vs_")
+                print(f"      ⬇ ({m_x:>20s}, {m_y:>20s}) was {ic:.2%} → now {cc:.2%}")
 
         # Compute standard error progress of Saturation models
         curr_sat_ses = {m: irt.compute_ability_se(m) for m in saturation_models}
@@ -880,6 +936,7 @@ def run_active_loop(
             "round": round_num,
             "thetas": {m: float(irt.thetas[m]) for m in irt.thetas},
             "new_item_difficulties": {q.id: float(irt.difficulties[q.id]) for q in round_new_questions},
+            "new_item_difficulties_anchored": {q.id: float(anchored_irt.difficulties[q.id]) for q in round_new_questions},
             "new_item_discriminations": {q.id: float(irt.discriminations.get(q.id, 1.0)) for q in round_new_questions},
         }
         irt_snapshots.append(irt_snapshot)
@@ -888,16 +945,33 @@ def run_active_loop(
             "round": round_num,
             "total_questions": len(all_generated_questions),
             "calibrated_pool_size": len(benchmark.questions),
-            "avg_discernability": float(avg_disc),
+            "prompter_type": prompter_type,
             "steps": round_step_details,
             "question_details": question_details,
             "scoring_details": round_scoring_details,  # full per-model logits/predictions
             "irt_snapshot": irt_snapshot,                # θ + b after refit
             "target_pairs_separability": target_pairs_separability,
+            "target_pairs_separability_anchored": target_pairs_separability_anchored,
             "avg_saturation_se": float(avg_curr_sat_se),
             "saturation_model_ses": {m: float(se) for m, se in curr_sat_ses.items()},
             "ability_mae": round_mae,
-            "targeting_mae": targeting_mae,
+            "targeting_mae_anchored": targeting_mae_anchored,
+            "targeting_mae_fpc": targeting_mae_fpc,
+            "targeting_mae": targeting_mae,  # backward compat (= anchored)
+            "difficulty_shift_stats": {
+                "anchored": {
+                    "mean": float(np.mean(difficulty_shifts_anchored)) if difficulty_shifts_anchored else None,
+                    "median": float(np.median(difficulty_shifts_anchored)) if difficulty_shifts_anchored else None,
+                    "std": float(np.std(difficulty_shifts_anchored)) if difficulty_shifts_anchored else None,
+                    "values": [float(s) for s in difficulty_shifts_anchored],
+                },
+                "fpc": {
+                    "mean": float(np.mean(difficulty_shifts_fpc)) if difficulty_shifts_fpc else None,
+                    "median": float(np.median(difficulty_shifts_fpc)) if difficulty_shifts_fpc else None,
+                    "std": float(np.std(difficulty_shifts_fpc)) if difficulty_shifts_fpc else None,
+                    "values": [float(s) for s in difficulty_shifts_fpc],
+                },
+            },
             "round_time_s": time.time() - round_start,
         }
         round_summaries.append(summary)
@@ -944,15 +1018,14 @@ def run_active_loop(
     for model_name in sorted(saturation_models):
         print(f"    {model_name:>25s}: {irt.thetas[model_name]:.4f} (Fisher SE: {initial_sat_ses[model_name]:.4f} → {final_sat_ses[model_name]:.4f})")
     print(f"{'='*80}")
-
     # ── Unanchored Rasch (1PL) Sanity Check ─────────────────────────────────
     print(f"\n=== 🧪 UNANCHORED RASCH (1PL) SANITY CHECK ===")
     unanchored_results = {}
     try:
         from torch_measure.models import Rasch
         from scipy.special import expit
-
-        # 1. Load original matrix and filter
+        from scipy.stats import norm
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         orig_df = original_response_matrix.copy()
         valid_subset = [m for m in MODEL_SUBSET if m in orig_df.index]
         orig_df = orig_df.loc[valid_subset]
@@ -1166,6 +1239,14 @@ def main(
     num_generation_steps: int = 10,
     generator_model: str = "openai/gpt-5.5",
     seed: int = 42,
+    prompter_type: str = "scaled_example",
+    double_ended: bool = True,
+    use_discernability: bool = True,
+    delta_percent: float = 0.25,
+    detailed_analysis_prompt: bool = False,
+    selector_offset: float = 0.0,
+    use_acc_norm: bool = True,
+    test_run: bool = False,
 ):
     """
     Launch the active question generation loop.
@@ -1173,7 +1254,11 @@ def main(
     """
     print(f"\nLaunching dynamic active learning loop:")
     print(f"  Rounds: {max_rounds}, Steps/round: {num_generation_steps}, Questions/step: {questions_per_round}")
-    print(f"  Generator: {generator_model}, Seed: {seed}\n")
+    print(f"  Prompter Type: {prompter_type}, Double Ended: {double_ended}, Discernability: {use_discernability}")
+    print(f"  Detailed Analysis Prompt: {detailed_analysis_prompt}")
+    print(f"  Selector Offset (AddOption): {selector_offset}")
+    print(f"  Use acc_norm Scoring: {use_acc_norm}")
+    print(f"  Generator: {generator_model}, Seed: {seed}, Test Run: {test_run}\n")
 
     results_json = run_active_loop.remote(
         max_rounds=max_rounds,
@@ -1181,6 +1266,14 @@ def main(
         num_generation_steps=num_generation_steps,
         generator_model=generator_model,
         seed=seed,
+        prompter_type=prompter_type,
+        double_ended=double_ended,
+        use_discernability=use_discernability,
+        delta_percent=delta_percent,
+        detailed_analysis_prompt=detailed_analysis_prompt,
+        selector_offset=selector_offset,
+        use_acc_norm=use_acc_norm,
+        test_run=test_run,
     )
 
     results = json.loads(results_json)
@@ -1196,100 +1289,3 @@ def main(
       f"{sum(r.get('total_questions', 0) for r in results['rounds'])}")
     print(f"   Total time: {results['total_time_s']/60:.1f} minutes")
 
-
-# ────────────────────────────────────────────────────────────────
-# CHEAP CPU PRE-DOWNLOADER
-# ────────────────────────────────────────────────────────────────
-
-@app.function(
-    image=loop_image,
-    volumes={
-        "/hf_cache": hf_cache_vol
-    },
-    env={"HF_HOME": "/hf_cache", "HF_HUB_DISABLE_PROGRESS_BARS": "1"},
-    secrets=[modal.Secret.from_name("huggingface")],
-    timeout=14400,  # 4 hours max
-)
-def pre_download_models_remote():
-    """Pre-download all models in MODEL_SUBSET to the persistent cache volume on a cheap CPU worker."""
-    import os
-    import time
-    from huggingface_hub import snapshot_download, login
-
-    if os.environ.get("HF_TOKEN"):
-        login(os.environ["HF_TOKEN"], add_to_git_credential=False)
-
-    # Clean up stale locks to prevent FileExistsError during snapshot downloads
-    locks_dir = "/hf_cache/hub/.locks"
-    if os.path.lexists(locks_dir):
-        print(f"🧹 Cleaning up stale HF download locks directory/link: {locks_dir}")
-        import shutil
-        try:
-            if os.path.islink(locks_dir):
-                os.unlink(locks_dir)
-            else:
-                shutil.rmtree(locks_dir, ignore_errors=True)
-        except Exception as del_err:
-            print(f"  ⚠️  Failed to delete locks directory: {del_err}")
-
-    print(f"\n=== PRE-DOWNLOADING {len(MODEL_SUBSET)} MODELS TO CACHE VOLUME ===")
-    start_time = time.time()
-
-    for i, model_short_name in enumerate(MODEL_SUBSET):
-        reg = MODEL_REGISTRY.get(model_short_name)
-        if not reg:
-            print(f"  ❌ Unknown model: {model_short_name}")
-            continue
-        hf_id = reg["hf_id"]
-        # HF cache dir for this model: /hf_cache/hub/models--{org}--{model}
-        cache_dir_name = f"models--{hf_id.replace('/', '--')}"
-        cache_path = os.path.join("/hf_cache", "hub", cache_dir_name)
-
-        print(f"\n[{i+1}/{len(MODEL_SUBSET)}] Downloading: {model_short_name} ({hf_id})...")
-        t0 = time.time()
-        try:
-            snapshot_download(
-                repo_id=hf_id,
-                ignore_patterns=["*.msgpack", "*.h5", "*.ot"],
-                local_files_only=False,
-            )
-            print(f"  ✅ Success in {time.time() - t0:.1f}s")
-        except Exception as e:
-            print(f"  ⚠️  First attempt failed: {e}")
-            # Check for corrupted cache dir (missing blobs/ or refs/, or broken symlinks)
-            if os.path.lexists(cache_path):
-                print(f"  🔧 Removing corrupted cache entry/link: {cache_path}")
-                import shutil
-                try:
-                    if os.path.islink(cache_path):
-                        os.unlink(cache_path)
-                    else:
-                        shutil.rmtree(cache_path, ignore_errors=True)
-                except Exception as del_err:
-                    print(f"  ⚠️  Failed to delete {cache_path}: {del_err}")
-                
-                # Retry
-                try:
-                    snapshot_download(
-                        repo_id=hf_id,
-                        ignore_patterns=["*.msgpack", "*.h5", "*.ot"],
-                        local_files_only=False,
-                    )
-                    print(f"  ✅ Retry success in {time.time() - t0:.1f}s")
-                except Exception as e2:
-                    print(f"  ❌ Retry also failed for {hf_id}: {e2}")
-            else:
-                print(f"  ❌ Failed to download {hf_id}: {e}")
-
-    total_time = time.time() - start_time
-    print(f"\n=== PRE-DOWNLOAD COMPLETE: {len(MODEL_SUBSET)} models in {total_time/60:.1f} minutes ===")
-    
-    print("Committing all changes to hf-cache-volume to persist model downloads...")
-    hf_cache_vol.commit()
-
-
-@app.local_entrypoint()
-def pre_download():
-    """Kicks off the CPU pre-downloader."""
-    print("Launching cheap CPU pre-downloader on Modal...")
-    pre_download_models_remote.remote()

@@ -26,6 +26,22 @@ JSON_RESPONSE_FORMAT_INSTRUCTION = """Respond STRICTLY with a single JSON object
   ]
 }"""
 
+SIMPLE_EXEMPLAR_INSTRUCTION = (
+    "Observe the relationship between vocabulary complexity, reasoning steps, "
+    "and distractors in the exemplars.\n\n"
+)
+
+DETAILED_EXEMPLAR_INSTRUCTION = (
+    "Carefully analyze each example question to understand its difficulty, "
+    "thinking about the following questions before generating your own:\n"
+    "* How many reasoning steps are needed to solve the question?\n"
+    "* What definitions or concepts are needed? At what grade level are they"
+    "typically taught? How memorable are they? \n"
+    "* How many distractors are frivolous, and how many are plausible? How plausible?\n"
+    "* Can the question be solved with pure word association or would that "
+    "lead to one of the distractors?\n\n"
+)
+
 
 def compute_lp_distance(
     q: Question,
@@ -232,11 +248,13 @@ class NearbyExamplePrompter(Prompter):
     def __init__(self, config: NearbyExamplePrompterConfig):
         self.config = config
 
-    def _select_examples(self, benchmark: Benchmark, target_profile: TargetProfile) -> List[Question]:
+    def _select_examples(self, benchmark: Benchmark, target_profile: TargetProfile, exclude_ids: Optional[List[str]] = None) -> List[Question]:
         # Filter by discernability (discrimination) thresholds if set
-        
         candidates = filter_by_discernability(benchmark.questions, self.config.min_discernability, self.config.max_discernability)
-        print(f"  [Prompter] NearbyExamplePrompter filtered candidates by discernability: {len(benchmark.questions)} -> {len(candidates)}")
+        if exclude_ids:
+            candidates = [c for c in candidates if c.id not in exclude_ids]
+
+        print(f"  [Prompter] NearbyExamplePrompter filtered candidates: {len(benchmark.questions)} -> {len(candidates)}")
         assert len(candidates) >= self.config.num_examples
 
         target_diff = target_profile.target_difficulty
@@ -250,22 +268,26 @@ class NearbyExamplePrompter(Prompter):
 
         return [candidates[idx] for idx in selected_indices]
 
-    def get_examples(self, benchmark: Benchmark, target_profile: TargetProfile) -> PrompterResponse:
+    def get_examples(self, benchmark: Benchmark, target_profile: TargetProfile, exclude_ids: Optional[List[str]] = None) -> PrompterResponse:
         # 1. Select optimal exemplars
-        selected = self._select_examples(benchmark, target_profile)
+        selected = self._select_examples(benchmark, target_profile, exclude_ids=exclude_ids)
         assert len(selected) == self.config.num_examples
 
         target_diff = target_profile.target_difficulty
 
         # 2. Format Exemplars using shared helper
         exemplars_str = format_exemplars(selected)
+        exemplar_instruction = (
+            DETAILED_EXEMPLAR_INSTRUCTION if self.config.detailed_analysis_prompt
+            else SIMPLE_EXEMPLAR_INSTRUCTION
+        )
 
         system_prompt = (
             "You are a world-class test designer and science curriculum developer.\n"
             "Your task is to write multiple-choice science questions for a benchmark.\n"
             "Each question must have exactly four options (A, B, C, D) and exactly one correct answer.\n"
             "You will be given several seed questions (exemplars).\n"
-            "Observe the relationship between vocabulary complexity, reasoning steps, and distractors in the exemplars.\n\n"
+            f"{exemplar_instruction}"
             f"{JSON_RESPONSE_FORMAT_INSTRUCTION}"
         )
 
@@ -304,11 +326,13 @@ class ScaledExamplePrompter(Prompter):
         self.config = config
         assert self.config.num_examples >= 2, "num_examples must be at least 2"
 
-    def _select_examples(self, benchmark: Benchmark, target_profile: TargetProfile) -> List[Question]:
+    def _select_examples(self, benchmark: Benchmark, target_profile: TargetProfile, exclude_ids: Optional[List[str]] = None) -> List[Question]:
         # Filter by discernability (discrimination) thresholds if set
         candidates = filter_by_discernability(benchmark.questions, self.config.min_discernability, self.config.max_discernability)
+        if exclude_ids:
+            candidates = [c for c in candidates if c.id not in exclude_ids]
 
-        print(f"  [Prompter] ScaledExamplePrompter filtered candidates by discernability: {len(benchmark.questions)} -> {len(candidates)}")
+        print(f"  [Prompter] ScaledExamplePrompter filtered candidates: {len(benchmark.questions)} -> {len(candidates)}")
         assert len(candidates) >= self.config.num_examples
 
         target_diff = target_profile.target_difficulty
@@ -343,11 +367,11 @@ class ScaledExamplePrompter(Prompter):
 
         return [candidates[i] for i in selected_indices]
 
-    def get_examples(self, benchmark: Benchmark, target_profile: TargetProfile) -> PrompterResponse:
+    def get_examples(self, benchmark: Benchmark, target_profile: TargetProfile, exclude_ids: Optional[List[str]] = None) -> PrompterResponse:
         from interfaces import PresentationStyle
 
         # 1. Select exemplars
-        selected_qs = self._select_examples(benchmark, target_profile)
+        selected_qs = self._select_examples(benchmark, target_profile, exclude_ids=exclude_ids)
         target_diff = target_profile.target_difficulty
 
         # Find lowest difficulty among selected
@@ -389,13 +413,17 @@ class ScaledExamplePrompter(Prompter):
         # 3. Format Exemplars using shared helper
         exemplars_str = format_exemplars(selected_qs, scaled_difficulties)
 
+        if self.config.detailed_analysis_prompt:
+            exemplar_instruction = DETAILED_EXEMPLAR_INSTRUCTION
+        else:
+            exemplar_instruction = SIMPLE_EXEMPLAR_INSTRUCTION
+
         system_prompt = (
             "You are an expert psychometrician and science curriculum developer.\n"
             "Your task is to write multiple-choice science questions for a benchmark.\n"
             "Each question must have exactly four options (A, B, C, D) and exactly one correct answer.\n"
             "You will be given several seed questions (exemplars) along with their difficulty ratings.\n"
-            "Observe the relationship between difficulty rating, vocabulary complexity, reasoning steps, "
-            "and distractors in the exemplars.\n\n"
+            f"{exemplar_instruction}"
             f"{style_instruction}\n"
             f"{JSON_RESPONSE_FORMAT_INSTRUCTION}"
         )
@@ -434,11 +462,14 @@ class IncreaseDifficultyPrompter(Prompter):
     def __init__(self, config: IncreaseDifficultyPrompterConfig):
         self.config = config
 
-    def _select_examples(self, benchmark: Benchmark, target_profile: TargetProfile) -> List[Question]:
+    def _select_examples(self, benchmark: Benchmark, target_profile: TargetProfile, exclude_ids: Optional[List[str]] = None) -> List[Question]:
         # Filter by discernability thresholds
         candidates = filter_by_discernability(
             benchmark.questions, self.config.min_discernability, self.config.max_discernability
         )
+        if exclude_ids:
+            candidates = [c for c in candidates if c.id not in exclude_ids]
+
         print(f"  [Prompter] IncreaseDifficultyPrompter filtered candidates: {len(benchmark.questions)} -> {len(candidates)}")
         
         target_diff = target_profile.target_difficulty
@@ -460,15 +491,15 @@ class IncreaseDifficultyPrompter(Prompter):
         )
         return [candidates[selected_indices[0]]]
 
-    def get_examples(self, benchmark: Benchmark, target_profile: TargetProfile) -> PrompterResponse:
+    def get_examples(self, benchmark: Benchmark, target_profile: TargetProfile, exclude_ids: Optional[List[str]] = None) -> PrompterResponse:
         # 1. Select base question
-        selected_qs = self._select_examples(benchmark, target_profile)
+        selected_qs = self._select_examples(benchmark, target_profile, exclude_ids=exclude_ids)
         base_q = selected_qs[0]
         target_diff = target_profile.target_difficulty
 
         system_prompt = (
             "You are an expert psychometrician, science test designer, and curriculum developer.\n"
-            "Your task is to read a given science question and rewrite it to be exactly "
+            "Your task is to read a given science question and rewrite it to be "
             f"{self.config.delta_percent:.0%} harder (increasing its difficulty rating).\n"
             "To increase the difficulty, you should:\n"
             "1. Introduce a deeper, more advanced scientific concept or a multi-step causal relationship.\n"
@@ -482,8 +513,8 @@ class IncreaseDifficultyPrompter(Prompter):
         user_prompt = (
             "Here is the base science question:\n\n"
             f"{format_question(base_q, include_answer=True)}\n\n"
-            f"Rewrite this question to make it exactly {self.config.delta_percent:.0%} harder.\n"
-            f"Generate exactly {self.config.num_questions} rewritten question(s) in the requested JSON format."
+            f"Rewrite this question to make it about {self.config.delta_percent:.0%} harder.\n"
+            f"Generate exactly {self.config.num_questions} rewritten version(s) in the requested JSON format."
         )
 
         trace = call_llm(
@@ -510,18 +541,21 @@ class AddOptionPrompter(Prompter):
     def __init__(self, config: AddOptionPrompterConfig):
         self.config = config
 
-    def _select_examples(self, benchmark: Benchmark, target_profile: TargetProfile) -> List[Question]:
+    def _select_examples(self, benchmark: Benchmark, target_profile: TargetProfile, exclude_ids: Optional[List[str]] = None) -> List[Question]:
         # Filter by discernability thresholds
         candidates = filter_by_discernability(
             benchmark.questions, self.config.min_discernability, self.config.max_discernability
         )
+        if exclude_ids:
+            candidates = [c for c in candidates if c.id not in exclude_ids]
+
         print(f"  [Prompter] AddOptionPrompter filtered candidates: {len(benchmark.questions)} -> {len(candidates)}")
         
         target_diff = target_profile.target_difficulty
         assert target_diff > self.config.min_difficulty, "Target difficulty must be strictly greater than minimum difficulty"
         
-        # Target base difficulty: assume N=4 options as default, so we want to select around target - 20% of scale
-        target_base_diff = target_diff - 0.20 * (target_diff - self.config.min_difficulty)
+        # Target base difficulty: assume N=4 options as default, so we want to select around target - 20% of scale + selector_offset
+        target_base_diff = target_diff - 0.20 * (target_diff - self.config.min_difficulty) + self.config.selector_offset
         
         if target_base_diff >= target_diff:
             target_base_diff = target_diff - 0.5
@@ -535,9 +569,9 @@ class AddOptionPrompter(Prompter):
         )
         return [candidates[selected_indices[0]]]
 
-    def get_examples(self, benchmark: Benchmark, target_profile: TargetProfile) -> PrompterResponse:
+    def get_examples(self, benchmark: Benchmark, target_profile: TargetProfile, exclude_ids: Optional[List[str]] = None) -> PrompterResponse:
         # 1. Select base question
-        selected_qs = self._select_examples(benchmark, target_profile)
+        selected_qs = self._select_examples(benchmark, target_profile, exclude_ids=exclude_ids)
         base_q = selected_qs[0]
         target_diff = target_profile.target_difficulty
         

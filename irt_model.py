@@ -142,8 +142,8 @@ class RaschModel(IRTModel):
         self,
         new_response_matrix: pd.DataFrame,
         original_response_matrix: pd.DataFrame = None,
-        max_iter: int = 1000,
-        lr: float = 0.01,
+        max_iter: int = 5000,
+        lr: float = 0.001,
         tol: float = 1e-6,
     ) -> Dict[str, float]:
         """
@@ -215,13 +215,17 @@ class RaschModel(IRTModel):
         b_orig = None
         if original_response_matrix is not None:
             # Only use original items whose difficulties we already have
-            orig_items = [c for c in original_response_matrix.columns
+            # Deduplicate columns first to avoid quadratic duplicates replication from index slicing
+            unique_cols = ~original_response_matrix.columns.duplicated()
+            original_matrix_unique = original_response_matrix.loc[:, unique_cols]
+            
+            orig_items = [c for c in original_matrix_unique.columns
                           if c in self.difficulties]
             orig_models = [m for m in model_names
-                           if m in original_response_matrix.index]
+                           if m in original_matrix_unique.index]
             if orig_items and orig_models:
                 # Reindex to match model_names ordering
-                R_orig_df = original_response_matrix.loc[orig_models, orig_items]
+                R_orig_df = original_matrix_unique.loc[orig_models, orig_items]
                 # Map to same model ordering
                 model_to_idx = {m: i for i, m in enumerate(model_names)}
                 orig_model_idxs = [model_to_idx[m] for m in orig_models]
@@ -241,23 +245,19 @@ class RaschModel(IRTModel):
             # ── Gradients from NEW items (optimize both θ and b_new) ──
             P_new = expit(theta_arr[:, None] - b_new[None, :])  # (n_models, n_new)
 
-            # Gradient for θ_j from new items: MEAN over valid items
+            # Gradient for θ_j from new items (sum, not mean — standard Rasch JMLE)
             grad_theta = np.zeros(n_models)
-            n_theta_obs = np.zeros(n_models)  # count observations per model
             for j in range(n_models):
                 valid = mask_new[j, :]
                 if valid.any():
                     grad_theta[j] += np.sum(R_new[j, valid] - P_new[j, valid])
-                    n_theta_obs[j] += valid.sum()
 
-            # Gradient for b_i (new items): MEAN over valid models
+            # Gradient for b_i (new items) — sum gradient
             grad_b_new = np.zeros(n_new)
-            n_b_obs = np.zeros(n_new)
             for i in range(n_new):
                 valid = mask_new[:, i]
                 if valid.any():
                     grad_b_new[i] = np.sum(P_new[valid, i] - R_new[valid, i])
-                    n_b_obs[i] = valid.sum()
 
             # ── Gradients from ORIGINAL items (optimize θ only, b fixed) ──
             if R_orig is not None and mask_orig is not None:
@@ -266,19 +266,12 @@ class RaschModel(IRTModel):
                     valid = mask_orig[j, :]
                     if valid.any():
                         grad_theta[j] += np.sum(R_orig[j, valid] - P_orig[j, valid])
-                        n_theta_obs[j] += valid.sum()
 
-            # Normalize gradients by observation count (mean, not sum)
-            for j in range(n_models):
-                if n_theta_obs[j] > 0:
-                    grad_theta[j] /= n_theta_obs[j]
-            for i in range(n_new):
-                if n_b_obs[i] > 0:
-                    grad_b_new[i] /= n_b_obs[i]
+
 
             # Update parameters (gradient ascent on log-likelihood)
             theta_arr += lr * grad_theta
-            b_new -= lr * grad_b_new  # NLL gradient for b is (p-r), so subtract
+            b_new += lr * grad_b_new  # grad_b_new is the gradient of log-likelihood, so add
 
             max_grad = max(np.max(np.abs(grad_theta)), np.max(np.abs(grad_b_new)))
             if max_grad < tol:

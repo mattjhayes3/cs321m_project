@@ -1,84 +1,60 @@
 """
-Evaluate Generated Questions on Modal
-=======================================
-Lightweight evaluation script that replicates the exact ARC-Easy format
-(multiple-choice log-likelihood scoring) without the lm_eval overhead.
-
-For each generated question and each model in the subset, we:
-1. Format: "Question: <text>\nAnswer: <option_text>"  for each option
-2. Compute the conditional log-likelihood of each option continuation
-3. Pick the option with the highest log-likelihood as the model's answer
-4. Score correct=1 if the chosen option matches the correct answer
-
-This matches lm_eval's "acc" metric for arc_easy exactly.
-
-Architecture: All models are evaluated SEQUENTIALLY on a single A100-80GB
-container to avoid paying N separate cold-start penalties. With only a handful
-of questions per model, the actual inference is trivial (~2s per model) and
-the dominant cost is model loading — which we'd pay either way.
+Parallel Evaluation Scorer Backend for Active Question Generation Loop.
+Hosts the Modal App definition, model registries, parallel lm_eval GPU containers,
+and the evaluate_questions_local orchestrator.
 
 Usage:
-    # From main.py pipeline (programmatic):
-    from evaluate_generated import evaluate_questions_on_models, build_response_matrix
-
-    # Standalone test:
-    modal run evaluate_generated.py
+  Imported by main.py to offload evaluation workloads onto on-demand GPU containers.
 """
 
-import json
 import os
 import time
+import json
 from typing import List, Dict, Any
-
+import pandas as pd
+import numpy as np
 import modal
-from huggingface_hub.utils import disable_progress_bars
-disable_progress_bars()
 
-# ══════════════════════════════════════════════════════════════════
-#  MODAL INFRASTRUCTURE
-# ══════════════════════════════════════════════════════════════════
+# ────────────────────────────────────────────────────────────────
+# MODAL INFRASTRUCTURE & IMAGES
+# ────────────────────────────────────────────────────────────────
 
-app = modal.App("eval-generated-questions")
+# Initialize the shared Modal App here to avoid circular imports
+app = modal.App("active-question-generation")
 
 results_vol = modal.Volume.from_name("benchmark-eval-results", create_if_missing=True)
+USE_ACC_NORM = True
+hf_cache_vol = modal.Volume.from_name("hf-cache-volume", create_if_missing=True)
 RESULTS_MOUNT = "/results"
 
-eval_image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .pip_install(
-        "torch",
-        "transformers",
-        "accelerate",
-        "huggingface_hub>=1.5.0",
-        "pandas",
-        "numpy",
-        "scipy",
-        "einops",
-    )
-)
+# Image used for the GPU scoring containers (reuses loop dependencies)
+from modal_image import loop_image
 
-# ══════════════════════════════════════════════════════════════════
-#  MODEL REGISTRY — maps short names to HF IDs
-#  (must match the names used in the pre-analysis evaluation)
-# ══════════════════════════════════════════════════════════════════
+# ────────────────────────────────────────────────────────────────
+# MODEL REGISTRY — maps short names to HF IDs
+# Hardcodes -deduped for Pythias; contains exactly our 32 active models.
+# ────────────────────────────────────────────────────────────────
 
+# Models to to evaluate and their approximate VRAM usage for scheduling.
+# Commented-out models either did not load correctly (getting near guessing performance) 
+# or were nearly identical to another variant (e.g. chat vs it models), left here for posterity.
 MODEL_REGISTRY = {
     "gemma1-2b":           {"hf_id": "google/gemma-2b",                    "vram_gb": 5.0},
-    "gemma1-2b-it":        {"hf_id": "google/gemma-2-2b-it",                 "vram_gb": 5.0},
+    # "gemma1-2b-it":        {"hf_id": "google/gemma-2-2b-it",                 "vram_gb": 5.0},
     "gemma1-7b":           {"hf_id": "google/gemma-7b",                    "vram_gb": 15.0},
-    "gemma1-7b-it":        {"hf_id": "google/gemma-7b-it",                 "vram_gb": 15.0},
+    # "gemma1-7b-it":        {"hf_id": "google/gemma-7b-it",                 "vram_gb": 15.0},
     "gemma2-2b":           {"hf_id": "google/gemma-2-2b",                  "vram_gb": 5.0},
-    "gemma2-2b-it":        {"hf_id": "google/gemma-2-2b-it",               "vram_gb": 5.0},
+    # "gemma2-2b-it":        {"hf_id": "google/gemma-2-2b-it",               "vram_gb": 5.0},
     "gemma2-9b-it":        {"hf_id": "google/gemma-2-9b-it",               "vram_gb": 19.0},
     "gemma3-1b-it":        {"hf_id": "google/gemma-3-1b-it",               "vram_gb": 3.0},
-    "gemma3-4b-it":        {"hf_id": "google/gemma-3-4b-it",               "vram_gb": 9.5},
-    "gemma3-12b-it":       {"hf_id": "google/gemma-3-12b-it",              "vram_gb": 26.0},
+    # "gemma3-4b-it":        {"hf_id": "google/gemma-3-4b-it",               "vram_gb": 9.5},
+    # "gemma3-12b-it":       {"hf_id": "google/gemma-3-12b-it",              "vram_gb": 26.0},
     "gpt2-small":          {"hf_id": "openai-community/gpt2",              "vram_gb": 1.0},
     "gpt2-large":          {"hf_id": "openai-community/gpt2-large",        "vram_gb": 2.0},
     "llama2-7b":           {"hf_id": "meta-llama/Llama-2-7b-hf",           "vram_gb": 15.0},
     "llama2-13b":          {"hf_id": "meta-llama/Llama-2-13b-hf",          "vram_gb": 28.0},
-    "llama2-7b-chat":      {"hf_id": "meta-llama/Llama-2-7b-chat-hf",      "vram_gb": 15.0},
-    "llama2-13b-chat":     {"hf_id": "meta-llama/Llama-2-13b-chat-hf",     "vram_gb": 28.0},
+    # "llama2-7b-chat":      {"hf_id": "meta-llama/Llama-2-7b-chat-hf",      "vram_gb": 15.0},
+    # "llama2-13b-chat":     {"hf_id": "meta-llama/Llama-2-13b-chat-hf",     "vram_gb": 28.0},
     "llama3-8b-inst":      {"hf_id": "meta-llama/Meta-Llama-3-8B-Instruct",   "vram_gb": 17.0},
     "llama3.1-8b-inst":    {"hf_id": "meta-llama/Llama-3.1-8B-Instruct",   "vram_gb": 17.0},
     "llama3.2-1b-inst":    {"hf_id": "meta-llama/Llama-3.2-1B-Instruct",   "vram_gb": 3.0},
@@ -86,388 +62,374 @@ MODEL_REGISTRY = {
     "mistral-7b-inst":     {"hf_id": "mistralai/Mistral-7B-Instruct-v0.3", "vram_gb": 15.0},
     "mistral-nemo":        {"hf_id": "mistralai/Mistral-Nemo-Instruct-2407", "vram_gb": 25.0},
     "phi3-mini":           {"hf_id": "microsoft/Phi-3-mini-4k-instruct",   "vram_gb": 8.0},
-    "pythia-70m":          {"hf_id": "EleutherAI/pythia-70m",              "vram_gb": 0.5},
-    "pythia-160m":         {"hf_id": "EleutherAI/pythia-160m",             "vram_gb": 0.8},
-    "pythia-410m":         {"hf_id": "EleutherAI/pythia-410m",             "vram_gb": 1.2},
-    "pythia-1b":           {"hf_id": "EleutherAI/pythia-1b",               "vram_gb": 2.5},
-    "pythia-1.4b":         {"hf_id": "EleutherAI/pythia-1.4b",             "vram_gb": 3.5},
-    "pythia-2.8b":         {"hf_id": "EleutherAI/pythia-2.8b",             "vram_gb": 7.0},
-    "pythia-6.9b":         {"hf_id": "EleutherAI/pythia-6.9b",             "vram_gb": 15.0},
-    "pythia-12b":          {"hf_id": "EleutherAI/pythia-12b",              "vram_gb": 26.0},
+    "pythia-70m":          {"hf_id": "EleutherAI/pythia-70m-deduped",      "vram_gb": 0.5},
+    "pythia-160m":         {"hf_id": "EleutherAI/pythia-160m-deduped",     "vram_gb": 0.8},
+    "pythia-410m":         {"hf_id": "EleutherAI/pythia-410m-deduped",     "vram_gb": 1.2},
+    "pythia-1b":           {"hf_id": "EleutherAI/pythia-1b-deduped",       "vram_gb": 2.5},
+    "pythia-1.4b":         {"hf_id": "EleutherAI/pythia-1.4b-deduped",     "vram_gb": 3.5},
+    "pythia-2.8b":         {"hf_id": "EleutherAI/pythia-2.8b-deduped",     "vram_gb": 7.0},
+    "pythia-6.9b":         {"hf_id": "EleutherAI/pythia-6.9b-deduped",     "vram_gb": 15.0},
+    "pythia-12b":          {"hf_id": "EleutherAI/pythia-12b-deduped",      "vram_gb": 26.0},
     "qwen2.5-3b-inst":     {"hf_id": "Qwen/Qwen2.5-3B-Instruct",           "vram_gb": 7.0},
     "qwen2.5-7b-inst":     {"hf_id": "Qwen/Qwen2.5-7B-Instruct",           "vram_gb": 15.0},
     "qwen2.5-14b-inst":    {"hf_id": "Qwen/Qwen2.5-14B-Instruct",          "vram_gb": 30.0},
     "qwen2.5-32b-inst":    {"hf_id": "Qwen/Qwen2.5-32B-Instruct",          "vram_gb": 66.0},
     "qwen2.5-coder-14b":   {"hf_id": "Qwen/Qwen2.5-Coder-14B-Instruct",   "vram_gb": 30.0},
     "qwen3-14b":           {"hf_id": "Qwen/Qwen3-14B",                     "vram_gb": 30.0, "trust_remote_code": True},
-    "qwen3-32b":           {"hf_id": "Qwen/Qwen3-32B",                     "vram_gb": 66.0, "trust_remote_code": True},
+    # "qwen3-32b":           {"hf_id": "Qwen/Qwen3-32B",                     "vram_gb": 66.0, "trust_remote_code": True},
     "qwen3.5-27b":         {"hf_id": "Qwen/Qwen3.5-27B",                   "vram_gb": 56.0, "trust_remote_code": True},
     "qwen3.5-35b":         {"hf_id": "Qwen/Qwen3.5-35B-A3B",               "vram_gb": 72.0, "trust_remote_code": True},
 }
 
-# ══════════════════════════════════════════════════════════════════
-#  CORE EVALUATION LOGIC
-# ══════════════════════════════════════════════════════════════════
+MODEL_SUBSET = list(MODEL_REGISTRY.keys())
 
-def _format_arc_easy_prompt(question_text: str) -> str:
-    """
-    Format a question context exactly as lm_eval does for arc_easy.
+# ────────────────────────────────────────────────────────────────
+# PARALLEL EVALUATION WORKERS
+# ────────────────────────────────────────────────────────────────
 
-    lm_eval's arc_easy uses the template:
-        "Question: <question>\nAnswer:"
-
-    The model scores the log-likelihood of " <option_text>" as continuation.
-    """
-    return f"Question: {question_text}\nAnswer:"
-
-
-def _score_options(model, tokenizer, question_text: str, options: List[str], device: str) -> dict:
-    """
-    Score each option by conditional log-likelihood and return scoring results.
-
-    This replicates lm_eval's multiple-choice scoring for both acc and acc_norm:
-    - context = "Question: <text>\nAnswer:"
-    - continuation = " <option_text>"
-    - acc:      argmax sum(log-probs of continuation tokens)
-    - acc_norm: argmax sum(log-probs) / num_continuation_tokens
-
-    Returns:
-        dict with keys:
-            pred_idx:      int — best option index using raw log-likelihood (acc)
-            pred_idx_norm: int — best option index using length-normalized ll (acc_norm)
-            scores:        list[float] — raw log-likelihood per option
-            scores_norm:   list[float] — length-normalized log-likelihood per option
-    """
-    import torch
-
-    # Resolve BPE tokenizer settings: match lm_eval's add_special_tokens behavior dynamically
-    add_special = getattr(tokenizer, "add_bos_token", True)
-
-    context = _format_arc_easy_prompt(question_text)
-    context_ids = tokenizer.encode(context, add_special_tokens=add_special, return_tensors="pt").to(device)
-    context_len = context_ids.shape[1]
-
-    scores = []
-    scores_norm = []
-
-    for idx, option in enumerate(options):
-        # Full sequence: context + " option_text"
-        full_text = context + " " + option
-        full_ids = tokenizer.encode(full_text, add_special_tokens=add_special, return_tensors="pt").to(device)
-
-        with torch.no_grad():
-            if device == "cuda":
-                with torch.autocast(device_type="cuda"):
-                    outputs = model(full_ids)
-            else:
-                outputs = model(full_ids)
-            logits = outputs.logits  # (1, seq_len, vocab_size)
-
-        # Log-probabilities of continuation tokens only
-        # Shift: logits[t] predicts token[t+1]
-        log_probs = torch.log_softmax(logits[0], dim=-1)
-
-        # Sum log-probs for continuation tokens (from context_len onward)
-        score = 0.0
-        n_cont_tokens = full_ids.shape[1] - context_len
-        for t in range(context_len - 1, full_ids.shape[1] - 1):
-            next_token = full_ids[0, t + 1]
-            score += log_probs[t, next_token].item()
-
-        scores.append(score)
-        # Length-normalized score (acc_norm): divide by number of continuation tokens
-        scores_norm.append(score / n_cont_tokens if n_cont_tokens > 0 else score)
-
-    best_idx = max(range(len(scores)), key=lambda i: scores[i])
-    best_idx_norm = max(range(len(scores_norm)), key=lambda i: scores_norm[i])
-
-    return {
-        "pred_idx": best_idx,
-        "pred_idx_norm": best_idx_norm,
-        "scores": scores,
-        "scores_norm": scores_norm,
-    }
+@app.function(image=loop_image, volumes={RESULTS_MOUNT: results_vol})
+def setup_lmeval_files(questions_list: List[dict], run_id: str, round_num: int):
+    """Sets up round-specific JSONL and YAML task files on the persistent Volume."""
+    import os
+    import json
+    
+    run_dir = f"{RESULTS_MOUNT}/active_loop_runs/{run_id}"
+    
+    # Write JSONL specifically for this round
+    jsonl_path = f"{RESULTS_MOUNT}/active_loop_runs/{run_id}/raw_data/round_{round_num}_questions.jsonl"
+    os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
+    with open(jsonl_path, "w") as f:
+        for q in questions_list:
+            labels = [chr(65 + i) for i in range(len(q["options"]))]
+            doc = {
+                "question": q["question_text"],
+                "choices": {
+                    "text": q["options"],
+                    "label": labels,
+                },
+                "answerKey": q["correct_answer"],
+                "id": q["id"],
+            }
+            f.write(json.dumps(doc) + "\n")
+            
+    # Clean run_id for YAML task name compliance (letters, numbers, underscores only)
+    clean_id = run_id.replace("-", "_").replace("T", "_").replace(":", "_")
+    task_name = f"gen_arc_task_{clean_id}_r{round_num}"
+    
+    # Write round task YAML pointing to this round's JSONL
+    yaml_path = f"{RESULTS_MOUNT}/{task_name}.yaml"
+    yaml_content = f"""task: {task_name}
+dataset_path: json
+dataset_kwargs:
+  data_files: {{"test": "{jsonl_path}"}}
+test_split: test
+output_type: multiple_choice
+doc_to_text: "Question: {{{{question}}}}\\nAnswer:"
+doc_to_target: "{{{{choices.label.index(answerKey)}}}}"
+doc_to_choice: "{{{{choices.text}}}}"
+metric_list:
+  - metric: acc
+  - metric: acc_norm
+metadata:
+  version: 1.0
+"""
+    with open(yaml_path, "w") as f:
+        f.write(yaml_content)
+        
+    results_vol.commit()
+        
+    print(f"Successfully setup unique YAML and JSONL files for {len(questions_list)} questions in Round {round_num}.")
+    return len(questions_list)
 
 
-def _evaluate_single_model(model_short_name: str, questions: List[dict]) -> dict:
-    """
-    Load a single model, score all questions, return results dict.
-    Called inside the remote Modal container.
-    """
-    import torch
-    import gc
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    reg = MODEL_REGISTRY.get(model_short_name)
-    if not reg:
-        return {"model": model_short_name, "results": [], "accuracy": 0.0,
-                "error": f"Unknown model: {model_short_name}"}
-
-    hf_id = reg["hf_id"]
-    trust_remote_code = reg.get("trust_remote_code", False)
-
-    print(f"\n  ── {model_short_name} ({hf_id}) ──")
-    load_start = time.time()
-
-    try:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        tokenizer_kwargs = {}
-        if "mistral" in hf_id.lower():
-            tokenizer_kwargs["fix_mistral_regex"] = True
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            hf_id, trust_remote_code=trust_remote_code, **tokenizer_kwargs
-        )
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        model = AutoModelForCausalLM.from_pretrained(
-            hf_id,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            trust_remote_code=trust_remote_code,
-        )
-        model.eval()
-        load_elapsed = time.time() - load_start
-        print(f"    Loaded in {load_elapsed:.1f}s")
-
-        results = []
-        n_correct = 0
-        n_correct_norm = 0
-        infer_start = time.time()
-
-        for q in questions:
-            score_result = _score_options(
-                model, tokenizer, q["question_text"], q["options"], device
-            )
-            # Use acc_norm (length-normalized) by default
-            predicted_idx = score_result["pred_idx_norm"]
-            predicted_letter = chr(65 + predicted_idx)
-            expected = q["correct_answer"].strip().upper()
-            correct = int(predicted_letter == expected)
-            n_correct_norm += correct
-
-            # Also track raw acc
-            predicted_letter_raw = chr(65 + score_result["pred_idx"])
-            correct_raw = int(predicted_letter_raw == expected)
-            n_correct += correct_raw
-
-            results.append({
-                "item_id": q["id"],
-                "correct": correct,
-                "correct_raw": correct_raw,
-                "predicted": predicted_letter,
-                "predicted_raw": predicted_letter_raw,
-                "expected": expected,
-            })
-
-        infer_elapsed = time.time() - infer_start
-        accuracy_norm = n_correct_norm / len(questions) if questions else 0.0
-        accuracy_raw = n_correct / len(questions) if questions else 0.0
-        print(f"    {n_correct_norm}/{len(questions)} correct ({accuracy_norm:.0%} acc_norm, {accuracy_raw:.0%} acc) — "
-              f"inference {infer_elapsed:.1f}s, load {load_elapsed:.1f}s")
-
-        # Free GPU memory before loading the next model
-        del model
-        del tokenizer
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        return {
-            "model": model_short_name,
-            "results": results,
-            "accuracy": accuracy_norm,
-            "accuracy_raw": accuracy_raw,
-            "error": None,
-        }
-
-    except Exception as e:
-        print(f"    ❌ Error: {e}")
-        # Clean up on error too
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        return {
-            "model": model_short_name,
-            "results": [],
-            "accuracy": 0.0,
-            "error": str(e),
-        }
-
-
-# ══════════════════════════════════════════════════════════════════
-#  MODAL FUNCTION: Single container evaluates ALL models sequentially
-# ══════════════════════════════════════════════════════════════════
-
-@app.function(
-    image=eval_image,
-    gpu="A100-80GB",
-    timeout=7200,  # 2 hours — enough for ~40 models sequentially
-    volumes={RESULTS_MOUNT: results_vol},
-    secrets=[modal.Secret.from_name("huggingface")],
-    memory=65536,
-    env={"HF_HUB_DISABLE_PROGRESS_BARS": "1"},
-)
-def evaluate_all_models_sequential(
-    questions_json: str,
-    model_names_json: str,
-) -> str:
-    """
-    Evaluate ALL models sequentially on a single A100-80GB container.
-
-    This avoids N separate cold-start penalties. With only a few questions
-    per model, inference is trivial (~2s) and model loading dominates.
-    Sequential on one machine means we pay for one cold start instead of N.
-
-    Models are loaded one at a time in fp16 with device_map="auto", scored,
-    then freed from GPU memory before loading the next.
-    """
+def run_lmeval_for_model(m_name: str, hf_id: str, trust_remote_code: bool, run_id: str, round_num: int, use_acc_norm: bool = True) -> dict:
+    """Helper inside the remote container that runs lm_eval CLI."""
+    global USE_ACC_NORM
+    USE_ACC_NORM = use_acc_norm
+    import subprocess
     from huggingface_hub import login
 
     if os.environ.get("HF_TOKEN"):
         login(os.environ["HF_TOKEN"], add_to_git_credential=False)
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
 
-    questions = json.loads(questions_json)
-    model_names = json.loads(model_names_json)
+    output_dir = f"/tmp/lmeval_out/{m_name}"
+    os.makedirs(output_dir, exist_ok=True)
 
-    print(f"\n{'='*70}")
-    print(f"  Sequential Evaluation: {len(questions)} questions × {len(model_names)} models")
-    print(f"  Container: A100-80GB (single instance)")
-    print(f"{'='*70}")
+    remote_code = "True" if trust_remote_code else "False"
+    model_args = f"pretrained={hf_id},dtype=float16,trust_remote_code={remote_code}"
+    
+    clean_id = run_id.replace("-", "_").replace("T", "_").replace(":", "_")
+    task_name = f"gen_arc_task_{clean_id}_r{round_num}"
+    
+    cmd = [
+        "lm_eval",
+        "--model", "hf",
+        "--model_args", model_args,
+        "--tasks", task_name,
+        "--include_path", RESULTS_MOUNT,
+        "--batch_size", "auto",
+        "--log_samples",
+        "--output_path", output_dir,
+    ]
 
-    all_results = {}
-    total_start = time.time()
+    print(f"[{m_name}] Command: {' '.join(cmd)}")
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    
+    if res.returncode != 0:
+        print(f"[{m_name}] ⚠️ Error code {res.returncode}: {res.stderr}")
+        return {"error": res.stderr or "Unknown error"}
 
-    for i, model_name in enumerate(model_names):
-        print(f"\n  [{i+1}/{len(model_names)}]", end="")
-        result = _evaluate_single_model(model_name, questions)
-        all_results[model_name] = result
+    # Parse samples JSONL
+    samples_file = None
+    for root, dirs, files in os.walk(output_dir):
+        for f in files:
+            if f.startswith(f"samples_{task_name}_") and f.endswith(".jsonl"):
+                samples_file = os.path.join(root, f)
+                break
+    
+    if not samples_file or not os.path.exists(samples_file):
+        return {"error": "Could not find samples JSONL output file!"}
 
-    total_elapsed = time.time() - total_start
+    results = {}
+    score_details = {}
+    
+    with open(samples_file) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            doc_res = json.loads(line)
+            doc_id = doc_res.get("doc", {}).get("id")
+            acc_norm = doc_res.get("acc_norm")
+            acc = doc_res.get("acc")
+            filtered = doc_res.get("filtered_resps", [])
+            choices = doc_res.get("doc", {}).get("choices", {}).get("text", [])
+            target = doc_res.get("target", "0")
+            
+            val_to_use = acc_norm if USE_ACC_NORM else acc
+            if doc_id is not None and val_to_use is not None:
+                results[doc_id] = int(val_to_use)
+                
+                # Reconstruct score details block matching custom scorer exactly!
+                try:
+                    pred_idx_norm = int(np.argmax([float(r[0])/len(opt) for r, opt in zip(filtered, choices)]))
+                except Exception:
+                    pred_idx_norm = int(target)
+                pred_letter = chr(65 + pred_idx_norm)
+                
+                try:
+                    pred_idx = int(np.argmax([float(r[0]) for r in filtered]))
+                except Exception:
+                    pred_idx = int(target)
+                pred_letter_raw = chr(65 + pred_idx)
+                
+                expected = chr(65 + int(target))
+                
+                score_details[doc_id] = {
+                    "scores": [float(r[0]) for r in filtered] if filtered else [0.0],
+                    "scores_norm": [float(r[0])/len(opt) for r, opt in zip(filtered, choices)] if filtered else [0.0],
+                    "pred_idx": pred_idx,
+                    "pred_idx_norm": pred_idx_norm,
+                    "pred_letter": pred_letter,
+                    "pred_letter_raw": pred_letter_raw,
+                    "expected": expected,
+                    "correct_norm": int(acc_norm),
+                    "correct_raw": int(acc),
+                }
 
-    # Summary
-    print(f"\n{'='*70}")
-    print(f"  Done — {len(model_names)} models in {total_elapsed/60:.1f} minutes")
-    n_success = sum(1 for r in all_results.values() if not r.get("error"))
-    n_failed = len(model_names) - n_success
-    print(f"  Success: {n_success}  |  Failed: {n_failed}")
-    print(f"{'='*70}")
+    # Also copy results to the run directory for archiving
+    archive_dir = f"{RESULTS_MOUNT}/active_loop_runs/{run_id}/raw_data/lmeval_parallel/round_{round_num}/{m_name}"
+    os.makedirs(archive_dir, exist_ok=True)
+    for root, dirs, files in os.walk(output_dir):
+        for f in files:
+            import shutil
+            shutil.copy2(os.path.join(root, f), os.path.join(archive_dir, f))
+            
+    return {"results": results, "score_details": score_details, "error": None}
 
-    return json.dumps(all_results)
+
+@app.function(
+    image=loop_image,
+    gpu="A10G",
+    volumes={
+        RESULTS_MOUNT: results_vol,
+        "/hf_cache": hf_cache_vol
+    },
+    env={"HF_HOME": "/hf_cache"},
+    secrets=[modal.Secret.from_name("huggingface")],
+    timeout=1800,
+    memory=16384,
+)
+def evaluate_single_model_a10g(m_name: str, hf_id: str, trust_remote_code: bool, run_id: str, round_num: int, use_acc_norm: bool = True) -> dict:
+    return run_lmeval_for_model(m_name, hf_id, trust_remote_code, run_id, round_num, use_acc_norm)
 
 
-# ══════════════════════════════════════════════════════════════════
-#  PUBLIC API: Called from main.py
-# ══════════════════════════════════════════════════════════════════
+@app.function(
+    image=loop_image,
+    gpu="A100-80GB",
+    volumes={
+        RESULTS_MOUNT: results_vol,
+        "/hf_cache": hf_cache_vol
+    },
+    env={"HF_HOME": "/hf_cache"},
+    secrets=[modal.Secret.from_name("huggingface")],
+    timeout=1800,
+    memory=32768,
+)
+def evaluate_single_model_a100(m_name: str, hf_id: str, trust_remote_code: bool, run_id: str, round_num: int, use_acc_norm: bool = True) -> dict:
+    return run_lmeval_for_model(m_name, hf_id, trust_remote_code, run_id, round_num, use_acc_norm)
 
-def evaluate_questions_on_models(
+
+def evaluate_questions_local(
     questions: List[Dict[str, Any]],
     model_names: List[str],
-) -> Dict[str, List[Dict[str, Any]]]:
+    run_id: str,
+    round_num: int,
+    use_acc_norm: bool = True,
+):
     """
-    Evaluate a list of generated questions across all specified models.
-
-    Dispatches everything to a single A100-80GB container that loads
-    models sequentially. Avoids N separate cold-start penalties.
-
-    Args:
-        questions: List of question dicts with id, question_text, options, correct_answer
-        model_names: List of model short names to evaluate on
-
-    Returns:
-        Dict mapping model_name -> list of per-question result dicts
-        Each result dict has: item_id, correct (0/1), predicted, expected
+    Evaluates generated questions in parallel on on-demand GPU containers on Modal.
+    Replaces the legacy sequential Dynamic VRAM Packing scheduler with massive throughput parallel scoring.
     """
-    questions_json = json.dumps(questions)
-    model_names_json = json.dumps(model_names)
-
-    print(f"\n🚀 Evaluating {len(questions)} questions on {len(model_names)} models "
-          f"(single A100, sequential)...")
-    start = time.time()
-
-    # Single remote call — one container, all models
-    raw_results_json = evaluate_all_models_sequential.remote(
-        questions_json, model_names_json
+    setup_lmeval_files.remote(questions, run_id, round_num)
+    
+    print(f"\n Launching parallel evaluations for {len(model_names)} models on Modal...")
+    # Sort model names in decreasing order of estimated VRAM to minimize tail latency under concurrent container limits
+    sorted_model_names = sorted(
+        model_names,
+        key=lambda m: MODEL_REGISTRY.get(m, {}).get("vram_gb", 10.0),
+        reverse=True
     )
-    raw_results = json.loads(raw_results_json)
-
-    elapsed = time.time() - start
-    print(f"\n  Done — {len(model_names)} models in {elapsed/60:.1f} minutes")
-
-    # Extract per-model result lists
-    all_results = {}
-    for name in model_names:
-        model_result = raw_results.get(name, {})
-        if model_result.get("error"):
-            print(f"  ❌ {name}: {model_result['error'][:100]}")
-            all_results[name] = []
+    
+    handles = []
+    for m_name in sorted_model_names:
+        cfg = MODEL_REGISTRY[m_name]
+        hf_id = cfg["hf_id"]
+        trust_remote_code = cfg.get("trust_remote_code", False)
+        
+        # GPU Routing Logic
+        is_large = any(tag in hf_id.lower() or tag in m_name.lower() for tag in [
+            "35b", "32b", "27b", "14b", "13b", "12b", "nemo"
+        ])
+        
+        # Check if results already exist on volume and are complete!
+        clean_id = run_id.replace("-", "_").replace("T", "_").replace(":", "_")
+        task_name = f"gen_arc_task_{clean_id}_r{round_num}"
+        
+        archive_dir = f"{RESULTS_MOUNT}/active_loop_runs/{run_id}/raw_data/lmeval_parallel/round_{round_num}/{m_name}"
+        samples_exist = False
+        if os.path.exists(archive_dir):
+            for f in os.listdir(archive_dir):
+                if f.startswith(f"samples_{task_name}_") and f.endswith(".jsonl"):
+                    try:
+                        # Count valid JSON lines in the file
+                        with open(os.path.join(archive_dir, f)) as file_obj:
+                            lines = sum(1 for line in file_obj if line.strip())
+                        if lines == len(questions):
+                            samples_exist = True
+                            break
+                        else:
+                            print(f"  ⚠️ {m_name:<22} cached file has incomplete count ({lines}/{len(questions)}), re-evaluating...")
+                    except Exception:
+                        pass
+                    
+        if samples_exist:
+            # Re-parse the existing file instead of re-running!
+            print(f"  ⏭️ {m_name:<22} [{hf_id}] skipping (cached results found)")
+            # We will parse this asynchronously in a lightweight mock handle
+            class MockHandle:
+                def __init__(self, name, u_norm):
+                    self.name = name
+                    self.u_norm = u_norm
+                def get(self):
+                    return parse_existing_results(self.name, run_id, round_num, self.u_norm)
+            handle = MockHandle(m_name, use_acc_norm)
         else:
-            acc = model_result.get("accuracy", 0)
-            print(f"  ✅ {name}: acc={acc:.1%}")
-            all_results[name] = model_result.get("results", [])
-
-    return all_results
-
-
-def build_response_matrix(
-    eval_results: Dict[str, List[Dict[str, Any]]],
-    question_ids: List[str],
-) -> "pd.DataFrame":
-    """
-    Build a binary response matrix (models × items) from evaluation results.
-
-    Returns:
-        pd.DataFrame with model names as index, question IDs as columns,
-        values are 0/1 (correct/incorrect).
-    """
-    import pandas as pd
-
+            if is_large:
+                print(f"  → {m_name:<22} [{hf_id}] spawning on A100-80GB...")
+                handle = evaluate_single_model_a100.spawn(m_name, hf_id, trust_remote_code, run_id, round_num, use_acc_norm)
+            else:
+                print(f"  → {m_name:<22} [{hf_id}] spawning on A10G...")
+                handle = evaluate_single_model_a10g.spawn(m_name, hf_id, trust_remote_code, run_id, round_num, use_acc_norm)
+                
+        handles.append((m_name, handle))
+        
+    print(f"⌛ Waiting for parallel evaluations to complete...")
     rows = {}
-    for model_name, results in eval_results.items():
-        result_map = {r["item_id"]: r["correct"] for r in results}
-        rows[model_name] = {qid: result_map.get(qid, float("nan")) for qid in question_ids}
+    all_score_details = {}
+    errors = {}
+    
+    for m_name, handle in handles:
+        try:
+            res = handle.get()
+            if res.get("error"):
+                print(f"  ❌ {m_name:<22} FAILED: {res['error'][:100]}")
+                errors[m_name] = res["error"]
+            else:
+                rows[m_name] = res["results"]
+                all_score_details[m_name] = res["score_details"]
+                print(f"  ✅ {m_name:<22} COMPLETED ({len(res['results'])} items)")
+        except Exception as e:
+            print(f"  ❌ {m_name:<22} EXCEPTION: {e}")
+            errors[m_name] = str(e)
+            
+    print(f"\n🏁 Evaluations completed: {len(rows)} successful, {len(errors)} failed.")
+    return pd.DataFrame.from_dict(rows, orient="index"), all_score_details
 
-    return pd.DataFrame.from_dict(rows, orient="index")
 
-
-# ══════════════════════════════════════════════════════════════════
-#  STANDALONE TEST ENTRY POINT
-# ══════════════════════════════════════════════════════════════════
-
-@app.local_entrypoint()
-def main():
-    """Standalone test: evaluate a few dummy questions on a small model."""
-    test_questions = [
-        {
-            "id": "test_q1",
-            "question_text": "What is the chemical symbol for water?",
-            "options": ["CO2", "NaCl", "O2", "H2O"],
-            "correct_answer": "D",
-        },
-        {
-            "id": "test_q2",
-            "question_text": "What planet is closest to the Sun?",
-            "options": ["Venus", "Mercury", "Earth", "Mars"],
-            "correct_answer": "B",
-        },
-    ]
-    test_models = ["pythia-70m", "gpt2-small"]
-
-    print("\n=== FORMATTED PROMPTS SEEN BY THE MODELS ===")
-    for q in test_questions:
-        context = f"Question: {q['question_text']}\nAnswer:"
-        print(f"\n• [Question ID: {q['id']}]")
-        print("  --- Context ---")
-        print(f"  {context!r}")
-        print("  --- Continuation Options (to evaluate log-likelihood) ---")
-        for opt in q['options']:
-            print(f"    - {f' {opt}'!r}")
-    print("============================================\n")
-
-    results = evaluate_questions_on_models(test_questions, test_models)
-
-    import pandas as pd
-    response_df = build_response_matrix(results, [q["id"] for q in test_questions])
-    print("\nResponse Matrix:")
-    print(response_df)
+def parse_existing_results(m_name: str, run_id: str, round_num: int, use_acc_norm: bool = True) -> dict:
+    """Helper to parse already completed results from volume instead of re-running."""
+    global USE_ACC_NORM
+    USE_ACC_NORM = use_acc_norm
+    clean_id = run_id.replace("-", "_").replace("T", "_").replace(":", "_")
+    task_name = f"gen_arc_task_{clean_id}_r{round_num}"
+    
+    archive_dir = f"{RESULTS_MOUNT}/active_loop_runs/{run_id}/raw_data/lmeval_parallel/round_{round_num}/{m_name}"
+    samples_file = None
+    for f in os.listdir(archive_dir):
+        if f.startswith(f"samples_{task_name}_") and f.endswith(".jsonl"):
+            samples_file = os.path.join(archive_dir, f)
+            break
+            
+    results = {}
+    score_details = {}
+    with open(samples_file) as f:
+        for line in f:
+            if not line.strip(): continue
+            doc_res = json.loads(line)
+            doc_id = doc_res.get("doc", {}).get("id")
+            acc_norm = doc_res.get("acc_norm")
+            acc = doc_res.get("acc")
+            filtered = doc_res.get("filtered_resps", [])
+            choices = doc_res.get("doc", {}).get("choices", {}).get("text", [])
+            target = doc_res.get("target", "0")
+            
+            val_to_use = acc_norm if USE_ACC_NORM else acc
+            if doc_id is not None and val_to_use is not None:
+                results[doc_id] = int(val_to_use)
+                try:
+                    pred_idx_norm = int(np.argmax([float(r[0])/len(opt) for r, opt in zip(filtered, choices)]))
+                except Exception:
+                    pred_idx_norm = int(target)
+                pred_letter = chr(65 + pred_idx_norm)
+                
+                try:
+                    pred_idx = int(np.argmax([float(r[0]) for r in filtered]))
+                except Exception:
+                    pred_idx = int(target)
+                pred_letter_raw = chr(65 + pred_idx)
+                
+                expected = chr(65 + int(target))
+                
+                score_details[doc_id] = {
+                    "scores": [float(r[0]) for r in filtered] if filtered else [0.0],
+                    "scores_norm": [float(r[0])/len(opt) for r, opt in zip(filtered, choices)] if filtered else [0.0],
+                    "pred_idx": pred_idx,
+                    "pred_idx_norm": pred_idx_norm,
+                    "pred_letter": pred_letter,
+                    "pred_letter_raw": pred_letter_raw,
+                    "expected": expected,
+                    "correct_norm": int(acc_norm),
+                    "correct_raw": int(acc),
+                }
+    return {"results": results, "score_details": score_details, "error": None}
