@@ -230,6 +230,7 @@ class IncreaseDifficultyPrompterConfig:
     max_tokens: int = 4096
     p: float = 2.0
     delta_percent: float = 0.25
+    difficulty_multiplier: float = 1.25
     num_questions: int = 1
     min_difficulty: float = -3.0
     min_discernability: Optional[float] = None

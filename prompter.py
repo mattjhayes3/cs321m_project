@@ -497,10 +497,15 @@ class IncreaseDifficultyPrompter(Prompter):
         base_q = selected_qs[0]
         target_diff = target_profile.target_difficulty
 
+        mult = self.config.difficulty_multiplier
+        if mult.is_integer() or mult >= 2.0:
+            mult_str = f"{int(mult)} times more difficult"
+        else:
+            mult_str = f"{(mult - 1):.0%} harder"
+
         system_prompt = (
             "You are an expert psychometrician, science test designer, and curriculum developer.\n"
-            "Your task is to read a given science question and rewrite it to be "
-            f"{self.config.delta_percent:.0%} harder (increasing its difficulty rating).\n"
+            f"Your task is to read a given science question and rewrite it to be {mult_str} (increasing its difficulty rating).\n"
             "To increase the difficulty, you should:\n"
             "1. Introduce a deeper, more advanced scientific concept or a multi-step causal relationship.\n"
             "2. Increase the vocabulary precision and sentence complexity.\n"
@@ -513,7 +518,7 @@ class IncreaseDifficultyPrompter(Prompter):
         user_prompt = (
             "Here is the base science question:\n\n"
             f"{format_question(base_q, include_answer=True)}\n\n"
-            f"Rewrite this question to make it about {self.config.delta_percent:.0%} harder.\n"
+            f"Rewrite this question to make it about {mult_str}.\n"
             f"Generate exactly {self.config.num_questions} rewritten version(s) in the requested JSON format."
         )
 

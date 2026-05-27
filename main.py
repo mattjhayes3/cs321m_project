@@ -342,6 +342,7 @@ def run_active_loop(
     detailed_analysis_prompt: bool = False,
     selector_offset: float = 0.0,
     use_acc_norm: bool = True,
+    difficulty_multiplier: float = 1.25,
     test_run: bool = False,
 ) -> str:
     """
@@ -417,6 +418,7 @@ def run_active_loop(
         "detailed_analysis_prompt": detailed_analysis_prompt,
         "selector_offset": selector_offset,
         "use_acc_norm": use_acc_norm,
+        "difficulty_multiplier": difficulty_multiplier,
         "double_ended": double_ended,
         "use_discernability": use_discernability,
         "delta_percent": delta_percent,
@@ -529,6 +531,7 @@ def run_active_loop(
                     p=2.0,
                     num_questions=questions_per_round,
                     delta_percent=delta_percent,
+                    difficulty_multiplier=difficulty_multiplier,
                     min_difficulty=step_target_diff - 1.5,
                     min_discernability=1 if use_discernability else None,
                     max_discernability=10 if use_discernability else None,
@@ -1246,6 +1249,7 @@ def main(
     detailed_analysis_prompt: bool = False,
     selector_offset: float = 0.0,
     use_acc_norm: bool = True,
+    difficulty_multiplier: float = 1.25,
     test_run: bool = False,
 ):
     """
@@ -1258,6 +1262,7 @@ def main(
     print(f"  Detailed Analysis Prompt: {detailed_analysis_prompt}")
     print(f"  Selector Offset (AddOption): {selector_offset}")
     print(f"  Use acc_norm Scoring: {use_acc_norm}")
+    print(f"  Difficulty Multiplier (IncreaseDifficulty): {difficulty_multiplier}")
     print(f"  Generator: {generator_model}, Seed: {seed}, Test Run: {test_run}\n")
 
     results_json = run_active_loop.remote(
@@ -1273,6 +1278,7 @@ def main(
         detailed_analysis_prompt=detailed_analysis_prompt,
         selector_offset=selector_offset,
         use_acc_norm=use_acc_norm,
+        difficulty_multiplier=difficulty_multiplier,
         test_run=test_run,
     )
 
