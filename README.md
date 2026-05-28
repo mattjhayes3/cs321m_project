@@ -54,7 +54,11 @@ An active learning system that uses **Item Response Theory (IRT)** to dynamicall
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-The system evaluates generated questions across **30+ open-weight models** (Pythia 70M → Qwen3.5-35B) using EleutherAI's `lm-evaluation-harness`, parallelized across Modal GPU containers.
+The system evaluates generated questions across **30+ open-weight models** (Pythia 70M → Qwen3.5-35B) using EleutherAI's `lm-evaluation-harness`, parallelized across Modal GPU containers. 
+
+This will max out your model GPU containers and it's recommended to be careful scaling up. However, as huggingface models are pre-downloaded to modal volume on a CPU worker, startup overhead costs are minimal. Cost is actually comparable and slightly faster than a highly optimized custom GPU-packing algorithm which attempted to replicate lm_eval's methodology, an approach that was abandoned in favor of consistency. Unfortuntely the dominant cost is loading and unloading models to VRAM, which you can't get around without moving to paid hosted APIs.
+
+Single round ablations from the paper should cost roughly $1.50 on modal and should take <10 minutes if nothing else is contending for modal containers. Full 10 round runs cost around $15 each and should take 1-2 hours without contention.  Total OpenAI costs should be <$25 to replicate all experiments. 
 
 ---
 
@@ -73,8 +77,8 @@ The system evaluates generated questions across **30+ open-weight models** (Pyth
 ### 1. Clone & Install Dependencies
 
 ```bash
-git clone <repository-url>
-cd Project
+git clone https://github.com/mattjhayes3/cs321m_project.git
+cd cs321m_project
 
 # Create a virtual environment (recommended)
 python -m venv .venv
@@ -128,7 +132,7 @@ Modal Volumes are created automatically on first run:
 - `benchmark-eval-results` — stores calibrated IRT data and run outputs
 - `hf-cache-volume` — caches Hugging Face model weights across runs
 
-> **Important:** The baseline calibration data (ARC-Easy response matrices, Rasch parameters) must already exist on the `benchmark-eval-results` volume. These were produced during the initial calibration phase of the project using the `Pre-analysis/` scripts. If you are starting from scratch, you will need to run the initial evaluation and calibration pipeline first (see `Pre-analysis/` directory).
+> **Note:** The pre-scraped, calibrated baseline data (ARC-Easy response matrices, Rasch difficulties, 2PL EM discriminations, and model abilities) is pre-packaged directly inside this repository under `baseline_data/`. On your very first run, the system will **automatically populate** your Modal Volume with these baselines. You do **not** need to run the initial calibration scripts in `Pre-analysis/` from scratch.
 
 ---
 
@@ -152,13 +156,10 @@ Project/
 ├── produce_figures.py       # Generates all paper figures from saved results
 ├── run_all_experiments.py   # Batch launcher for all experiment configurations
 ├── project.py               # Project directory path constant
-├── .env                     # API keys (not committed to git)
 ├── active_loop_runs/        # Downloaded run results (local)
 ├── results/                 # Aggregated analysis outputs
 ├── custom_tasks/            # YAML task definitions for lm-evaluation-harness
-├── final_manuscript/        # LaTeX source for the paper
 ├── Pre-analysis/            # Initial calibration and exploration scripts
-└── scratch/                 # Exploratory scripts
 ```
 
 ---
@@ -173,7 +174,7 @@ The `--test-run` flag restricts evaluation to small models (< 7GB VRAM) for fast
 modal run main.py --test-run --max-rounds 1 --num-generation-steps 2 --questions-per-round 2
 ```
 
-This takes ~10–15 minutes and is useful for verifying your setup.
+This completes in under 5 minutes and is useful for verifying your setup.
 
 ### Full Active Loop
 
@@ -294,7 +295,7 @@ All arguments are passed via `modal run main.py --<arg>`:
 | Argument | Default | Description |
 |---|---|---|
 | `--max-rounds` | `10` | Number of active loop iterations |
-| `--questions-per-round` | `5` | Questions generated per generation step |
+| `--questions-per-round` | `5` | Questions generated per generation step (use 1 for AddOption, 2 for IncreaseDifficulty, and 5 for everything else) |
 | `--num-generation-steps` | `10` | Number of target-pair generation steps per round |
 | `--generator-model` | `openai/gpt-5.5` | LLM used for question generation |
 | `--prompter-type` | `scaled_example` | Generation strategy (`scaled_example`, `add_option`, `increase_difficulty`, `nearby_example`) |
@@ -303,5 +304,40 @@ All arguments are passed via `modal run main.py --<arg>`:
 | `--delta-percent` | `0.25` | Target difficulty increase fraction (IncreaseDifficulty only) |
 | `--selector-offset` | `0.0` | Difficulty offset for target selection (AddOption only) |
 | `--seed` | `42` | Random seed for reproducibility |
-| `--use-acc-norm` | `True` | Use length-normalized accuracy scoring |
+| `--use-acc-norm` | `False` | Use length-normalized accuracy scoring |
 | `--test-run` | `False` | Restrict to small models for fast testing |
+
+---
+
+## Expected Runtime & Computational Requirements
+
+- **Quick Test Run** (`--test-run` with `--max-rounds 1`): Completes in **under 5 minutes**.
+- **Full Active Learning Loop (10 Rounds)**:
+  - **Wall-Clock Time**: Approximately **1 to 2 hours** if running without container contention on Modal.
+  - **Per-Round Breakdown**:
+    - OpenAI Generation step: ~10–30 seconds.
+    - Parallel GPU Evaluation fan-out (lm-evaluation-harness on 30+ models): ~5–8 minutes.
+    - Anchored IRT Refit: ~5 seconds.
+  - **Modal GPU Billing**: Around **$1.50** per ablation/single-round test run, and **$15.00** for a full 10-round active learning loop.
+  - **OpenAI API Billing**: Approximately **<$25.00** to replicate all experiments in the paper.
+
+---
+
+## Figure & Table Reproducibility Mapping
+
+The plotting script `produce_figures.py` parses the JSON round snapshots and baseline calibrations, generating all primary and appendix figures/tables directly into `final_manuscript/figures/`:
+
+| Paper Result | Script Function | Output Artifact |
+|---|---|---|
+| **Figure 1** (Ability Estimate Comparison) | `plot_ability_comparison` | `ability_comparison.pdf` |
+| **Figure 2** (Ability Trajectory & SE Ribbons) | `plot_ability_trajectory` | `ability_trajectory.pdf` |
+| **Figure 3** (Avg SE & Targeting MAE Progression) | `plot_se_and_mae_trajectory` | `se_mae_trajectory.pdf` |
+| **Figure 4** (Pair Separability Bar & Gains) | `plot_separability_heatmap` | `separability.pdf` |
+| **Figure 5** (Kendall Rank Correlation vs. Benchmarks) | `plot_kendall_correlation` | `kendall_correlation.pdf` |
+| **Figure 6** (Generated Question Examples Table) | `save_question_examples` | `question_examples.md` |
+| **Figure 7** (Difficulty Shift Histogram) | `plot_difficulty_shift` | `targeting_error_histogram.pdf` |
+| **Figure 8** (Pairs Resolved Trajectory) | `plot_pairs_resolved` | `pairs_resolved.pdf` |
+| **Figure 9** (Ability MAE Scale Stability Drift) | `plot_ability_mae_drift` | `ability_mae_drift.pdf` |
+| **Figure 10** (Summary Dashboard Dashboard) | `plot_summary_dashboard` | `summary_dashboard.pdf` |
+| **Figure 11** (Items Needed Under Original Dist) | `plot_items_needed` | `items_needed.pdf` |
+

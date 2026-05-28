@@ -1,35 +1,35 @@
 # Core
-numpy
-pandas
-scipy
-torch
-tqdm
+numpy==2.4.0
+pandas==2.3.3
+scipy==1.17.0
+torch==2.10.0
+tqdm==4.67.1
 
 # LLM APIs
-openai
+openai==2.21.0
 anthropic
-python-dotenv
+python-dotenv==1.2.1
 
 # Hugging Face
-datasets
-transformers
-accelerate
-huggingface_hub>=1.5.0
-tokenizers
-sentence-transformers
+datasets==4.5.0
+transformers==4.57.3
+accelerate==1.12.0
+huggingface-hub>=0.34.6
+tokenizers==0.22.2
+sentence-transformers==5.4.1
 
 # Evaluation
-lm-eval[hf,api]
+lm-eval[hf,api]==0.4.12
 
 # IRT / Psychometrics
-py-irt
-scikit-learn
+torch-measure
 
 # Visualization
-matplotlib
-seaborn
+matplotlib==3.10.8
+seaborn==0.13.2
 
 # Infrastructure
-modal
-einops
-requests
+modal==1.4.2
+einops==0.8.2
+requests==2.32.5
+scikit-learn==1.6.1

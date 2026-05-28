@@ -1183,11 +1183,17 @@ def main():
     baseline_thetas = load_baseline_thetas(args.project_dir)
     
     # Load external benchmark data
+    ext_path = args.external_benchmarks
+    if not ext_path:
+        ext_path = os.path.join(args.project_dir, "results", "external_benchmarks.json")
+    
     external_data = {}
-    if args.external_benchmarks and os.path.exists(args.external_benchmarks):
-        with open(args.external_benchmarks) as f:
+    if os.path.exists(ext_path):
+        with open(ext_path) as f:
             external_data = json.load(f)
-        print(f"  Loaded external benchmarks: {list(external_data.keys())}")
+        print(f"  Loaded external benchmarks: {list(external_data.keys())} from {ext_path}")
+    else:
+        print(f"  Warning: External benchmarks file not found at {ext_path}")
     
     # Generate all figures
     print("\n" + "─" * 60)

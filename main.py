@@ -141,6 +141,73 @@ class RealBenchmark(Benchmark):
         return pd.DataFrame()
 
 
+def ensure_baseline_data(volume):
+    """
+    Ensure that pre-scraped and calibrated baseline data is present on the Modal Volume.
+    If any required baseline files are missing from /results, copy them from the image's
+    pre-baked baseline_data/ directory and commit the volume.
+    """
+    import os
+    import shutil
+
+    baseline_src_dir = "/root/baseline_data"
+    results_dest_dir = "/results"
+
+    if not os.path.exists(baseline_src_dir):
+        print("  [baseline_data] Warning: Pre-baked baseline_data directory not found in image.")
+        return
+
+    # List of files we want to ensure are present on the volume
+    required_paths = [
+        "arc_easy_eval/irt_ability_estimates.csv",
+        "arc_easy_eval/irt_item_parameters.csv",
+        "arc_easy_eval/irt_item_parameters_2pl.csv",
+        "arc_easy_eval/item_parameters_comprehensive_acc_norm.csv",
+        "arc_easy_eval/response_matrix.csv",
+        "arc_easy_eval/response_matrix_cumulative_acc_norm.csv",
+        "arc_easy_eval/theta_comparison_comprehensive_acc_norm.csv"
+    ]
+
+    missing_any = False
+    for rel_path in required_paths:
+        vol_path = os.path.join(results_dest_dir, rel_path)
+        if not os.path.exists(vol_path):
+            missing_any = True
+            break
+
+    if missing_any:
+        print("  [baseline_data] Detected missing calibrated baseline files on Modal Volume.")
+        print("  [baseline_data] Copying pre-scraped baseline files to volume...")
+        copied_count = 0
+        for rel_path in required_paths:
+            src_path = os.path.join(baseline_src_dir, rel_path)
+            dest_path = os.path.join(results_dest_dir, rel_path)
+            
+            if os.path.exists(src_path):
+                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                if not os.path.exists(dest_path):
+                    try:
+                        shutil.copy2(src_path, dest_path)
+                        copied_count += 1
+                    except Exception as copy_err:
+                        print(f"  [baseline_data] Error copying {src_path} to {dest_path}: {copy_err}")
+            else:
+                print(f"  [baseline_data] Warning: Expected baseline file not found in image: {src_path}")
+
+        if copied_count > 0:
+            print(f"  [baseline_data] Successfully copied {copied_count} baseline files to Modal Volume.")
+            print("  [baseline_data] Committing changes to volume...")
+            try:
+                volume.commit()
+                print("  [baseline_data] Volume commit successful.")
+            except Exception as e:
+                print(f"  [baseline_data] Warning: Failed to commit volume: {e}")
+        else:
+            print("  [baseline_data] No files were copied.")
+    else:
+        print("  [baseline_data] All pre-scraped baseline files are present on the Modal Volume.")
+
+
 def load_calibrated_benchmark(volume, use_acc_norm: bool = True):
     """
     Load calibrated IRT parameters + original response matrix from Volume.
@@ -149,6 +216,9 @@ def load_calibrated_benchmark(volume, use_acc_norm: bool = True):
         (benchmark, original_response_matrix)
     """
     from datasets import load_dataset
+
+    # Automatically verify/populate baseline files on volume before loading
+    ensure_baseline_data(volume)
 
     print("=== Loading Calibrated Benchmark ===")
 
@@ -359,7 +429,7 @@ def run_active_loop(
     delta_percent: float = 0.25,
     detailed_analysis_prompt: bool = False,
     selector_offset: float = 0.0,
-    use_acc_norm: bool = True,
+    use_acc_norm: bool = False,
     difficulty_multiplier: float = 1.25,
     test_run: bool = False,
 ) -> str:
@@ -1269,7 +1339,7 @@ def main(
     delta_percent: float = 0.25,
     detailed_analysis_prompt: bool = False,
     selector_offset: float = 0.0,
-    use_acc_norm: bool = True,
+    use_acc_norm: bool = False,
     difficulty_multiplier: float = 1.25,
     test_run: bool = False,
 ):

@@ -44,7 +44,9 @@ loop_image = (
         "matplotlib",
         "sentence-transformers",
         "scikit-learn",
+        "torch-measure",
     )
+    .add_local_dir("baseline_data", "/root/baseline_data")
     .add_local_file("interfaces.py", "/root/interfaces.py", copy=True)
     .add_local_file("irt_model.py", "/root/irt_model.py", copy=True)
     .add_local_file("question_generator.py", "/root/question_generator.py", copy=True)
@@ -57,5 +59,4 @@ loop_image = (
     .add_local_file("benchmark.py", "/root/benchmark.py", copy=True)
     .add_local_file("main.py", "/root/main.py", copy=True)
     .add_local_file("modal_image.py", "/root/modal_image.py", copy=True)
-    .add_local_dir("../Competition/torch_measure/src/torch_measure", "/root/torch_measure")
 )
