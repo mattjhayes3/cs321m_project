@@ -32,12 +32,12 @@ An active learning system that uses **Item Response Theory (IRT)** to dynamicall
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        LOCAL MACHINE                                │
-│  main.py (local entrypoint) ──► modal run ──► Remote A100 Container │
+│  main.py (local entrypoint) ──► modal run ──► Remote CPU Container  │
 └─────────────────────┬───────────────────────────────────────────────┘
                       │
                       ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                  MODAL CLOUD (per round)                             │
+│                  MODAL CLOUD (per round)                            │
 │                                                                     │
 │  1. Load calibrated benchmark from Modal Volume                     │
 │  2. Identify saturation band (models with θ > 0.5)                  │
@@ -168,7 +168,7 @@ Project/
 
 ### Quick Start: Run a Test Loop
 
-The `--test-run` flag restricts evaluation to small models (< 7GB VRAM) for fast iteration:
+The `--test-run` flag restricts evaluation to small models (< 7GB VRAM) for fast sanity checks, but results will be very different than a real run due to the model set and targets. 
 
 ```bash
 modal run main.py --test-run --max-rounds 1 --num-generation-steps 2 --questions-per-target 2
@@ -247,10 +247,10 @@ Results are saved to `active_loop_runs/<run_id>/` with:
 Generate all paper figures from downloaded results:
 
 ```bash
-python produce_figures.py
+python produce_figures.py --run-dir active_loop_runs/<run_id>
 ```
 
-Figures are saved to `results/` and `plots_comparison/`.
+Figures are saved to `final_manuscript/figures/`.
 
 ---
 
