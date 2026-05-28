@@ -20,6 +20,11 @@ class RaschModel(IRTModel):
 
     def fit(self, response_matrix: pd.DataFrame) -> None:
         import torch
+        import sys
+        from unittest.mock import MagicMock
+        sys.modules["tabpfn"] = MagicMock()
+        sys.modules["pyro"] = MagicMock()
+        sys.modules["pyro.distributions"] = MagicMock()
         from torch_measure.models import Rasch
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -317,6 +322,11 @@ class RaschModel(IRTModel):
                 "discriminations": Dict of new item discriminations
         """
         import torch
+        import sys
+        from unittest.mock import MagicMock
+        sys.modules["tabpfn"] = MagicMock()
+        sys.modules["pyro"] = MagicMock()
+        sys.modules["pyro.distributions"] = MagicMock()
         from torch_measure.models import TwoPL
         from scipy.special import expit
 

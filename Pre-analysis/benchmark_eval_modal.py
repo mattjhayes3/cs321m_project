@@ -617,6 +617,11 @@ def _run_irt_analysis_remote(task_name: str) -> dict:
     n_valid = valid_mask.sum()
     print(f"Items with variance > 0: {n_valid} / {n_items}")
 
+    import sys
+    from unittest.mock import MagicMock
+    sys.modules["tabpfn"] = MagicMock()
+    sys.modules["pyro"] = MagicMock()
+    sys.modules["pyro.distributions"] = MagicMock()
     from torch_measure.models import Rasch
 
     R_tensor = torch.tensor(R_valid, dtype=torch.float32, device=device)

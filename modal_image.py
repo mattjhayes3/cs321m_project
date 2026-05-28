@@ -44,9 +44,9 @@ loop_image = (
         "matplotlib",
         "sentence-transformers",
         "scikit-learn",
-        "torch-measure",
     )
-    .add_local_dir("baseline_data", "/root/baseline_data")
+    .run_commands("pip install torch-measure --no-deps")
+    .add_local_dir("baseline_data", "/root/baseline_data", copy=True)
     .add_local_file("interfaces.py", "/root/interfaces.py", copy=True)
     .add_local_file("irt_model.py", "/root/irt_model.py", copy=True)
     .add_local_file("question_generator.py", "/root/question_generator.py", copy=True)

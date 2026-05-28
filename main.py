@@ -1116,6 +1116,11 @@ def run_active_loop(
     print(f"\n=== 🧪 UNANCHORED RASCH (1PL) SANITY CHECK ===")
     unanchored_results = {}
     try:
+        import sys
+        from unittest.mock import MagicMock
+        sys.modules["tabpfn"] = MagicMock()
+        sys.modules["pyro"] = MagicMock()
+        sys.modules["pyro.distributions"] = MagicMock()
         from torch_measure.models import Rasch
         from scipy.special import expit
         from scipy.stats import norm
