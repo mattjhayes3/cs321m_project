@@ -114,7 +114,8 @@ def call_llm(
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
             kwargs["temperature"] = 1.0
         else:
-            kwargs["temperature"] = temperature
+            if "opus" not in model_name.lower() and "3-7" not in model_name.lower():
+                kwargs["temperature"] = temperature
 
         try:
             response = client.messages.create(**kwargs)

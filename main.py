@@ -247,8 +247,25 @@ def load_calibrated_benchmark(volume, use_acc_norm: bool = True):
         for _, row in item_params_df.iterrows():
             item_id = str(row["item_id"])
             irt.difficulties[item_id] = float(row["b_difficulty"])
-            # 1PL/Rasch baseline has no discrimination, default to 1.0 for filtering safety
+            # Default to 1.0, will be overridden by 2PL file if available
             irt.discriminations[item_id] = 1.0
+
+        # Load 2PL EM discrimination parameters for discernability filtering
+        try:
+            disc_bytes = b""
+            for chunk in volume.read_file("arc_easy_eval/irt_item_parameters_2pl.csv"):
+                disc_bytes += chunk
+            disc_df = pd.read_csv(io.BytesIO(disc_bytes))
+            disc_loaded = 0
+            for _, row in disc_df.iterrows():
+                item_id = str(row["item_id"])
+                if item_id in irt.discriminations:
+                    irt.discriminations[item_id] = float(row["EM_Discrimination"])
+                    disc_loaded += 1
+            print(f"  Loaded 2PL EM discriminations for {disc_loaded} items from irt_item_parameters_2pl.csv")
+        except Exception as e:
+            print(f"  ⚠️ Could not load 2PL discrimination file (irt_item_parameters_2pl.csv): {e}")
+            print(f"  ⚠️ All discriminations defaulted to 1.0 — discernability filter will be inert!")
 
     irt.valid_items = list(irt.difficulties.keys())
 
@@ -326,6 +343,7 @@ def save_json(path: str, data: dict):
     secrets=[
         modal.Secret.from_name("huggingface"),
         modal.Secret.from_name("openai"),
+        modal.Secret.from_name("anthropic"),
     ],
     memory=16384,
 )
@@ -499,6 +517,9 @@ def run_active_loop(
         question_to_step = {}
         used_exemplar_ids = set()
 
+        # Dynamically disable thinking budget for Anthropic/Claude models to bypass API thinking.type.enabled constraint
+        thinking_budget_val = 0 if "claude" in generator_model.lower() or "anthropic" in generator_model.lower() else 4096
+
         for step_idx in range(1, num_generation_steps + 1):
             if not target_pairs: break
             state = np.random.RandomState(round_seed + step_idx)
@@ -509,7 +530,7 @@ def run_active_loop(
                 prompter_config = ScaledExamplePrompterConfig(
                     generator_model=generator_model,
                     temperature=0.7,
-                    thinking_budget=4096,
+                    thinking_budget=thinking_budget_val,
                     max_tokens=16384,
                     p=2.0,
                     num_examples=4,
@@ -526,7 +547,7 @@ def run_active_loop(
                 prompter_config = IncreaseDifficultyPrompterConfig(
                     generator_model=generator_model,
                     temperature=0.7,
-                    thinking_budget=4096,
+                    thinking_budget=thinking_budget_val,
                     max_tokens=16384,
                     p=2.0,
                     num_questions=questions_per_round,
@@ -541,7 +562,7 @@ def run_active_loop(
                 prompter_config = AddOptionPrompterConfig(
                     generator_model=generator_model,
                     temperature=0.7,
-                    thinking_budget=4096,
+                    thinking_budget=thinking_budget_val,
                     max_tokens=16384,
                     p=2.0,
                     num_questions=questions_per_round,
@@ -555,7 +576,7 @@ def run_active_loop(
                 prompter_config = NearbyExamplePrompterConfig(
                     generator_model=generator_model,
                     temperature=0.7,
-                    thinking_budget=4096,
+                    thinking_budget=thinking_budget_val,
                     max_tokens=16384,
                     p=2.0,
                     num_examples=4,

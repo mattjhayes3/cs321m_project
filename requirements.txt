@@ -1,0 +1,35 @@
+# Core
+numpy
+pandas
+scipy
+torch
+tqdm
+
+# LLM APIs
+openai
+anthropic
+python-dotenv
+
+# Hugging Face
+datasets
+transformers
+accelerate
+huggingface_hub>=1.5.0
+tokenizers
+sentence-transformers
+
+# Evaluation
+lm-eval[hf,api]
+
+# IRT / Psychometrics
+py-irt
+scikit-learn
+
+# Visualization
+matplotlib
+seaborn
+
+# Infrastructure
+modal
+einops
+requests

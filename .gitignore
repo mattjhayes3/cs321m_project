@@ -1,0 +1,20 @@
+theory.*
+.DS_Store
+.env
+__pycache__
+*.png
+final_manuscript/
+results/
+NeurIPS 2025 Styles/
+*.pdf
+active_loop_runs/
+brainstorming.txt
+custom_tasks
+deep_research.txt
+outline.md
+plots_comparison
+scratch
+*_backup.log
+Pre-analysis/pre_analysis.*
+Pre-analysis/neurips_2025.*
+Pre-analysis/references.bib
