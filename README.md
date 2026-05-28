@@ -303,7 +303,7 @@ All arguments are passed via `modal run main.py --<arg>`:
 | `--use-discernability` | `True` | Enable discernability filtering in prompts |
 | `--delta-percent` | `0.25` | Target difficulty increase fraction (IncreaseDifficulty only) |
 | `--selector-offset` | `0.0` | Difficulty offset for target selection (AddOption only) |
-| `--seed` | `42` | Random seed for reproducibility |
+| `--seed` | `42` | Random seed for reproducibility (paper used 42, but OpenAI does not respect seeds) |
 | `--use-acc-norm` | `False` | Use length-normalized accuracy scoring |
 | `--test-run` | `False` | Restrict to small models for fast testing |
 
