@@ -46,7 +46,7 @@ def main():
         "modal", "run", "main.py::main",
         "--prompter-type", "increase_difficulty",
         "--num-generation-steps", "25",
-        "--questions-per-round", "2",
+        "--questions-per-target", "2",
         "--delta-percent", "0.25"
     ])
     
@@ -56,7 +56,7 @@ def main():
         "modal", "run", "main.py::main",
         "--prompter-type", "add_option",
         "--num-generation-steps", "25",
-        "--questions-per-round", "2"
+        "--questions-per-target", "2"
     ])
     
     print("\n=== All experiments finished! ===")

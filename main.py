@@ -23,7 +23,7 @@ Each run creates a timestamped log folder on the Modal volume with:
 Usage:
     modal run main.py                          # run with defaults
     modal run main.py --max-rounds 10          # 10 iterations
-    modal run main.py --questions-per-round 1  # 1 question per round
+    modal run main.py --questions-per-target 1 # 1 question per target
     modal run main.py --seed 42                # fixed seed for reproducibility
 """
 
@@ -419,7 +419,7 @@ def save_json(path: str, data: dict):
 )
 def run_active_loop(
     max_rounds: int = 3,
-    questions_per_round: int = 5,
+    questions_per_target: int = 5,
     num_generation_steps: int = 10,
     generator_model: str = "openai/gpt-5.5",
     seed: int = 42,
@@ -498,7 +498,7 @@ def run_active_loop(
     # ── Save config ─────────────────────────────────────────────
     run_config = {
         "max_rounds": max_rounds,
-        "questions_per_round": questions_per_round,
+        "questions_per_target": questions_per_target,
         "num_generation_steps": num_generation_steps,
         "generator_model": generator_model,
         "seed": seed,
@@ -604,7 +604,7 @@ def run_active_loop(
                     max_tokens=16384,
                     p=2.0,
                     num_examples=4,
-                    num_questions=questions_per_round,
+                    num_questions=questions_per_target,
                     min_difficulty=step_target_diff - 1.5,
                     presentation=PresentationStyle.POSITIVE_UNBOUNDED,
                     double_ended=double_ended,
@@ -620,7 +620,7 @@ def run_active_loop(
                     thinking_budget=thinking_budget_val,
                     max_tokens=16384,
                     p=2.0,
-                    num_questions=questions_per_round,
+                    num_questions=questions_per_target,
                     delta_percent=delta_percent,
                     difficulty_multiplier=difficulty_multiplier,
                     min_difficulty=step_target_diff - 1.5,
@@ -635,7 +635,7 @@ def run_active_loop(
                     thinking_budget=thinking_budget_val,
                     max_tokens=16384,
                     p=2.0,
-                    num_questions=questions_per_round,
+                    num_questions=questions_per_target,
                     min_difficulty=step_target_diff - 1.5,
                     min_discernability=1 if use_discernability else None,
                     max_discernability=10 if use_discernability else None,
@@ -650,7 +650,7 @@ def run_active_loop(
                     max_tokens=16384,
                     p=2.0,
                     num_examples=4,
-                    num_questions=questions_per_round,
+                    num_questions=questions_per_target,
                     min_discernability=1 if use_discernability else None,
                     max_discernability=10 if use_discernability else None,
                     detailed_analysis_prompt=detailed_analysis_prompt,
@@ -739,6 +739,20 @@ def run_active_loop(
             round_step_details.append(step_detail)
 
         if not round_new_questions: continue
+
+        # Print one example question from the generated pool for this round
+        try:
+            example_q = round_new_questions[0]
+            from utils import format_question
+            print(f"\n✨ [Example Question generated in Round {round_num}]")
+            q_step_info = question_to_step.get(example_q.id, {})
+            if q_step_info:
+                print(f"   Target Midpoint: {q_step_info.get('model_a')} vs {q_step_info.get('model_b')} (target θ = {q_step_info.get('midpoint_diff'):.3f})")
+            print(format_question(example_q, include_answer=True))
+            print(f"✨" + "─"*78 + "\n")
+        except Exception as print_err:
+            print(f"  ⚠️ Failed to print example question: {print_err}")
+
         all_generated_questions.extend(round_new_questions)
 
         # ── 3. Evaluation ─────────────
@@ -1334,7 +1348,7 @@ def run_active_loop(
 @app.local_entrypoint()
 def main(
     max_rounds: int = 10,
-    questions_per_round: int = 5,
+    questions_per_target: int = 5,
     num_generation_steps: int = 10,
     generator_model: str = "openai/gpt-5.5",
     seed: int = 42,
@@ -1353,7 +1367,7 @@ def main(
     All computation happens on a single remote A100 container.
     """
     print(f"\nLaunching dynamic active learning loop:")
-    print(f"  Rounds: {max_rounds}, Steps/round: {num_generation_steps}, Questions/step: {questions_per_round}")
+    print(f"  Rounds: {max_rounds}, Steps/round: {num_generation_steps}, Questions/target: {questions_per_target}")
     print(f"  Prompter Type: {prompter_type}, Double Ended: {double_ended}, Discernability: {use_discernability}")
     print(f"  Detailed Analysis Prompt: {detailed_analysis_prompt}")
     print(f"  Selector Offset (AddOption): {selector_offset}")
@@ -1363,7 +1377,7 @@ def main(
 
     results_json = run_active_loop.remote(
         max_rounds=max_rounds,
-        questions_per_round=questions_per_round,
+        questions_per_target=questions_per_target,
         num_generation_steps=num_generation_steps,
         generator_model=generator_model,
         seed=seed,

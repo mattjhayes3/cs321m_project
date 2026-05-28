@@ -171,7 +171,7 @@ Project/
 The `--test-run` flag restricts evaluation to small models (< 7GB VRAM) for fast iteration:
 
 ```bash
-modal run main.py --test-run --max-rounds 1 --num-generation-steps 2 --questions-per-round 2
+modal run main.py --test-run --max-rounds 1 --num-generation-steps 2 --questions-per-target 2
 ```
 
 This completes in under 5 minutes and is useful for verifying your setup.
@@ -189,7 +189,7 @@ Or with explicit arguments:
 ```bash
 modal run main.py \
   --max-rounds 10 \
-  --questions-per-round 5 \
+  --questions-per-target 5 \
   --num-generation-steps 10 \
   --prompter-type scaled_example \
   --generator-model "openai/gpt-5.5" \
@@ -275,7 +275,7 @@ modal run main.py \
   --prompter-type add_option \
   --max-rounds 10 \
   --num-generation-steps 25 \
-  --questions-per-round 2 \
+  --questions-per-target 2 \
   --seed 42
 
 # ── Step 5: Download results ──
@@ -295,8 +295,8 @@ All arguments are passed via `modal run main.py --<arg>`:
 | Argument | Default | Description |
 |---|---|---|
 | `--max-rounds` | `10` | Number of active loop iterations |
-| `--questions-per-round` | `5` | Questions generated per generation step (use 1 for AddOption, 2 for IncreaseDifficulty, and 5 for everything else) |
-| `--num-generation-steps` | `10` | Number of target-pair generation steps per round |
+| `--questions-per-target` | `5` | Questions generated per target (use 1 for AddOption, 2 for IncreaseDifficulty, and 5 for everything else) |
+| `--num-generation-steps` | `10` | Target-pair generation steps per round (default: 10 targets × 5 questions = 50 questions/round) |
 | `--generator-model` | `openai/gpt-5.5` | LLM used for question generation |
 | `--prompter-type` | `scaled_example` | Generation strategy (`scaled_example`, `add_option`, `increase_difficulty`, `nearby_example`) |
 | `--double-ended` | `True` | Enable double-ended difficulty targeting (ScaledExample only) |
