@@ -209,17 +209,27 @@ The system supports four question generation strategies, each with different str
 
 ### Run All Experiments
 
-To launch the full experiment suite (all strategies × ablation configurations):
+A script is provided to list or launch all 13 single-round and 3 10-round active question generation loop configurations described in the paper.
 
+To list all available configurations:
 ```bash
-python run_all_experiments.py
+python3 run_all_experiments.py --list
 ```
 
-This sequentially runs:
-1. `ScaledExample` (double-ended disabled)
-2. `ScaledExample` (no discernability filter)
-3. `IncreaseDifficulty` (25 steps × 2 questions)
-4. `AddOption` (25 steps × 2 questions)
+To run a specific experiment or a subset of experiments by their ID:
+```bash
+python3 run_all_experiments.py --run 1,5,12,16
+```
+
+To run all 16 experiments sequentially:
+```bash
+python3 run_all_experiments.py --run all
+```
+
+You can also override the default random seed:
+```bash
+python3 run_all_experiments.py --run 12 --seed 100
+```
 
 ### Download Results from Modal
 
