@@ -1130,6 +1130,7 @@ def run_active_loop(
     print(f"\n=== 🧪 UNANCHORED RASCH (1PL) SANITY CHECK ===")
     unanchored_results = {}
     try:
+        # Hack to make torch_measure compatible with lm_eval
         import sys
         from unittest.mock import MagicMock
         sys.modules["tabpfn"] = MagicMock()
